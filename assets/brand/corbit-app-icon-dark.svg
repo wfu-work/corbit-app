@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">Corbit dark application icon</title>
+  <desc id="description">A flat white tri-link symbol around an open core on a black background.</desc>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#0A0A0A"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="124" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M512 454V300H690"/>
+    <path d="M512 454V300H690" transform="rotate(120 512 512)"/>
+    <path d="M512 454V300H690" transform="rotate(240 512 512)"/>
+  </g>
+  <circle cx="512" cy="512" r="82" fill="#0A0A0A"/>
+</svg>

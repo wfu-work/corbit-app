@@ -1,0 +1,33 @@
+[package]
+name = "corbit-app"
+description = "Native GPUI desktop client for Corbit"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+corbit-client.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+async-channel.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+security-framework = "3.7.0"
+security-framework-sys = "2.17.0"
+tray-icon = { version = "0.24.2", default-features = false }
+
+[build-dependencies]
+winresource = "0.1"
+
+[lints]
+workspace = true

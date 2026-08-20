@@ -1,0 +1,6 @@
+Codex/OpenAI and Claude/Anthropic brand marks are trademarks of their
+respective owners. They are included only to identify the corresponding
+locally installed provider.
+
+The vector paths match the provider marks already used by the upstream Paseo
+client in packages/app/src/components/icons/.

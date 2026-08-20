@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1800" viewBox="0 0 1800 1800" role="img" aria-labelledby="title description">
+  <title id="title">Corbit light and dark logo preview</title>
+  <desc id="description">The same flat tri-link mark shown as black on white and white on black, without a wordmark.</desc>
+  <rect width="900" height="1800" fill="#ECECEC"/>
+  <rect x="900" width="900" height="1800" fill="#202020"/>
+
+  <g transform="translate(50 500) scale(0.78)">
+    <rect x="100" y="100" width="824" height="824" rx="185" fill="#FFFFFF"/>
+    <g fill="none" stroke="#0A0A0A" stroke-width="124" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M512 454V300H690"/>
+      <path d="M512 454V300H690" transform="rotate(120 512 512)"/>
+      <path d="M512 454V300H690" transform="rotate(240 512 512)"/>
+    </g>
+    <circle cx="512" cy="512" r="82" fill="#FFFFFF"/>
+  </g>
+
+  <g transform="translate(950 500) scale(0.78)">
+    <rect x="100" y="100" width="824" height="824" rx="185" fill="#0A0A0A"/>
+    <g fill="none" stroke="#FFFFFF" stroke-width="124" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M512 454V300H690"/>
+      <path d="M512 454V300H690" transform="rotate(120 512 512)"/>
+      <path d="M512 454V300H690" transform="rotate(240 512 512)"/>
+    </g>
+    <circle cx="512" cy="512" r="82" fill="#0A0A0A"/>
+  </g>
+</svg>
