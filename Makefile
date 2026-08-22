@@ -2,6 +2,7 @@
 
 APP_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 WORKSPACE_DIR := $(abspath $(APP_DIR)/..)
+DAEMON_DIR := $(WORKSPACE_DIR)/corbit-daemon
 ARTIFACTS_DIR ?= $(WORKSPACE_DIR)/artifacts
 CARGO_TARGET_DIR ?= $(APP_DIR)/target
 CARGO ?= cargo
@@ -41,6 +42,7 @@ BINARY_EXT :=
 endif
 
 VERSION ?= $(shell sed -n 's/^version = "\([^"]*\)"/\1/p' "$(APP_DIR)/Cargo.toml" | head -1)
+DAEMON_VERSION ?= $(shell sed -n 's/.*"version": "\([^"]*\)".*/\1/p' "$(DAEMON_DIR)/package.json" | head -1)
 BINARY_PATH := $(CARGO_TARGET_DIR)/$(RUST_TARGET)/$(CARGO_PROFILE_DIR)/corbit-app$(BINARY_EXT)
 DEV_BINARY_PATH ?= $(CARGO_TARGET_DIR)/debug/corbit-app$(BINARY_EXT)
 DEV_PID_FILE ?= $(CARGO_TARGET_DIR)/corbit-app-dev.pid
@@ -55,7 +57,7 @@ DEV_APP_DIR := $(DEV_ARTIFACTS_DIR)/desktop/macos-$(HOST_ARCH)/$(DEV_APP_NAME).a
 DEV_LAUNCH_BINARY := $(DEV_APP_DIR)/Contents/MacOS/corbit
 endif
 
-.PHONY: help doctor validate rust-target binary package build dev dev-stop dev-restart run test lint check \
+.PHONY: help doctor validate rust-target binary daemon-runtime package daemon-smoke build dev dev-verify dev-stop dev-restart run test lint check \
 	macos-arm64 macos-x64 macos-universal linux-arm64 linux-x64 \
 	windows-arm64 windows-x64
 
@@ -64,6 +66,8 @@ help:
 	@echo ""
 	@echo "  make build PLATFORM=macos ARCH=arm64 MODE=release"
 	@echo "  make dev                           Build and replace the tracked debug client"
+	@echo "  make dev-verify                    Verify the generated debug app identity"
+	@echo "  make daemon-smoke                  Package and start an isolated Daemon runtime"
 	@echo "  make dev-stop                      Stop the tracked debug client"
 	@echo "  make dev-restart                   Rebuild and restart the debug client"
 	@echo "  make rust-target PLATFORM=macos ARCH=x64"
@@ -85,21 +89,34 @@ rust-target: validate
 	@$(RUSTUP) target add "$(RUST_TARGET)"
 
 binary: validate
-	@$(CARGO) build --locked --manifest-path "$(APP_DIR)/Cargo.toml" \
+	@CORBIT_DAEMON_VERSION="$(DAEMON_VERSION)" $(CARGO) build --locked --manifest-path "$(APP_DIR)/Cargo.toml" \
 		--package corbit-app --target "$(RUST_TARGET)" $(CARGO_PROFILE_FLAG) $(CARGO_FLAGS)
 
-package: binary
+daemon-runtime: validate
+	@test -d "$(DAEMON_DIR)" || (echo "Missing Corbit Daemon checkout: $(DAEMON_DIR)"; exit 2)
+	@$(MAKE) --no-print-directory -C "$(DAEMON_DIR)" package \
+		PLATFORM="$(PLATFORM)" ARCH="$(ARCH)" ARTIFACTS_DIR="$(ARTIFACTS_DIR)"
+
+package: binary daemon-runtime
 	@$(NODE) "$(APP_DIR)/scripts/package-desktop.mjs" \
 		--platform "$(PLATFORM)" --arch "$(ARCH)" \
 		--rust-target "$(RUST_TARGET)" --profile "$(CARGO_PROFILE_DIR)" \
 		--version "$(VERSION)" --binary "$(BINARY_PATH)" \
 		--assets "$(APP_DIR)/assets/brand" --output "$(ARTIFACTS_DIR)" \
+		--daemon-runtime "$(ARTIFACTS_DIR)/daemon/$(PLATFORM)-$(ARCH)/corbit-daemon" \
+		--daemon-version "$(DAEMON_VERSION)" \
 		--sign-identity "$(MACOS_SIGN_IDENTITY)"
+daemon-smoke: package
+	@$(NODE) "$(APP_DIR)/scripts/smoke-daemon-runtime.mjs" \
+		--runtime "$(ARTIFACTS_DIR)/daemon/$(PLATFORM)-$(ARCH)/corbit-daemon" \
+		--version "$(DAEMON_VERSION)" --platform "$(PLATFORM)" --arch "$(ARCH)" \
+		--node "$(shell command -v $(NODE))"
 
-build: package
+build: daemon-smoke
 
 dev:
-	@CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) build --locked \
+	@$(MAKE) --no-print-directory daemon-runtime PLATFORM="$(HOST_PLATFORM)" ARCH="$(HOST_ARCH)"
+	@CORBIT_BUILD_CHANNEL=dev CORBIT_DAEMON_VERSION="$(DAEMON_VERSION)" CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" $(CARGO) build --locked \
 		--manifest-path "$(APP_DIR)/Cargo.toml" --package corbit-app $(CARGO_FLAGS)
 ifeq ($(HOST_PLATFORM),macos)
 	@$(NODE) "$(APP_DIR)/scripts/package-desktop.mjs" \
@@ -108,11 +125,28 @@ ifeq ($(HOST_PLATFORM),macos)
 		--version "$(VERSION)" --binary "$(DEV_BINARY_PATH)" \
 		--assets "$(APP_DIR)/assets/brand" --output "$(DEV_ARTIFACTS_DIR)" \
 		--app-name "$(DEV_APP_NAME)" --bundle-identifier "$(DEV_BUNDLE_IDENTIFIER)" \
+		--daemon-runtime "$(ARTIFACTS_DIR)/daemon/$(HOST_PLATFORM)-$(HOST_ARCH)/corbit-daemon" \
+		--daemon-version "$(DAEMON_VERSION)" \
 		--sign-identity "$(MACOS_SIGN_IDENTITY)"
+	@$(MAKE) --no-print-directory dev-verify
 endif
 	@$(NODE) "$(APP_DIR)/scripts/dev.mjs" --action run \
 		--binary "$(DEV_BINARY_PATH)" --launch-binary "$(DEV_LAUNCH_BINARY)" \
 		--pid-file "$(DEV_PID_FILE)"
+
+dev-verify:
+ifeq ($(HOST_PLATFORM),macos)
+	@$(NODE) "$(APP_DIR)/scripts/verify-desktop-bundle.mjs" \
+		--app "$(DEV_APP_DIR)" --name "$(DEV_APP_NAME)" \
+		--bundle-identifier "$(DEV_BUNDLE_IDENTIFIER)" --version "$(VERSION)" \
+		--daemon-version "$(DAEMON_VERSION)" --arch "$(HOST_ARCH)"
+	@$(NODE) "$(APP_DIR)/scripts/smoke-daemon-runtime.mjs" \
+		--runtime "$(DEV_APP_DIR)/Contents/Resources/corbit-daemon" \
+		--version "$(DAEMON_VERSION)" --platform macos --arch "$(HOST_ARCH)" \
+		--node "$(shell command -v $(NODE))"
+else
+	@echo "dev-verify is only available for macOS app bundles"
+endif
 
 dev-stop:
 	@$(NODE) "$(APP_DIR)/scripts/dev.mjs" --action stop \
@@ -164,4 +198,11 @@ macos-universal:
 		--profile "$(CARGO_PROFILE_DIR)" --version "$(VERSION)" \
 		--binary "$(CARGO_TARGET_DIR)/universal-apple-darwin/$(CARGO_PROFILE_DIR)/corbit-app" \
 		--assets "$(APP_DIR)/assets/brand" --output "$(ARTIFACTS_DIR)" \
+		--daemon-runtime-arm64 "$(ARTIFACTS_DIR)/daemon/macos-arm64/corbit-daemon" \
+		--daemon-runtime-x64 "$(ARTIFACTS_DIR)/daemon/macos-x64/corbit-daemon" \
+		--daemon-version "$(DAEMON_VERSION)" \
 		--sign-identity "$(MACOS_SIGN_IDENTITY)"
+	@$(NODE) "$(APP_DIR)/scripts/smoke-daemon-runtime.mjs" \
+		--runtime "$(ARTIFACTS_DIR)/desktop/macos-universal/Corbit.app/Contents/Resources/corbit-daemon/$(HOST_ARCH)" \
+		--version "$(DAEMON_VERSION)" --platform macos --arch "$(HOST_ARCH)" \
+		--node "$(shell command -v $(NODE))"

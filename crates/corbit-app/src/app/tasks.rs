@@ -32,6 +32,8 @@ pub(super) struct PendingNewTaskRecovery {
     provider: String,
     title: String,
     prompt: String,
+    #[serde(default)]
+    prompt_options: Option<corbit_client::AgentPromptOptions>,
     agent_id: Option<String>,
     stage: NewTaskRecoveryStage,
     #[serde(default)]
@@ -97,6 +99,8 @@ enum NewTaskAttemptResult {
         agent_id: String,
         snapshot: Option<corbit_client::AuthoritativeSnapshot>,
         turn_id: String,
+        provider: String,
+        prompt_options: Option<corbit_client::AgentPromptOptions>,
     },
     Failed {
         recovery: Box<PendingNewTaskRecovery>,
@@ -123,27 +127,6 @@ enum NewTaskCleanupResult {
         snapshot: Option<corbit_client::AuthoritativeSnapshot>,
     },
 }
-
-const PROVIDERS: [(&str, &str, &str, &str); 3] = [
-    (
-        "codex",
-        "Codex",
-        "codexProviderSessions",
-        "OpenAI Codex 本机 Agent 会话",
-    ),
-    (
-        "claude",
-        "Claude",
-        "claudeProviderSessions",
-        "Anthropic Claude Code Agent 会话",
-    ),
-    (
-        "acp",
-        "ACP",
-        "acpProviderSessions",
-        "兼容 Agent Client Protocol 的 Agent 会话",
-    ),
-];
 
 async fn prepare_new_task_workspace(
     client: &corbit_client::DaemonRuntimeClient,
@@ -251,18 +234,31 @@ async fn execute_new_task_attempt(
         }
     }
 
-    match client
-        .prompt(
-            agent_id.clone(),
-            recovery.prompt.clone(),
-            recovery.prompt_mutation_id.clone(),
-        )
-        .await
-    {
+    let prompt_result = if let Some(options) = recovery.prompt_options.clone() {
+        client
+            .prompt_with_options(
+                agent_id.clone(),
+                recovery.prompt.clone(),
+                recovery.prompt_mutation_id.clone(),
+                options,
+            )
+            .await
+    } else {
+        client
+            .prompt(
+                agent_id.clone(),
+                recovery.prompt.clone(),
+                recovery.prompt_mutation_id.clone(),
+            )
+            .await
+    };
+    match prompt_result {
         Ok(acknowledgement) => NewTaskAttemptResult::Completed {
             agent_id,
             snapshot: latest_snapshot,
             turn_id: acknowledgement.turn_id,
+            provider: recovery.provider,
+            prompt_options: recovery.prompt_options,
         },
         Err(error) => failed_new_task_attempt(
             recovery,
@@ -390,32 +386,20 @@ impl ConnectionView {
         if let Some(catalog) = &self.provider_catalog {
             return PROVIDERS
                 .iter()
-                .filter(|(id, _, _, _)| {
+                .filter(|provider| {
                     catalog
                         .providers
                         .iter()
-                        .any(|provider| provider.provider_id == *id && provider.available)
+                        .any(|entry| entry.provider_id == provider.id && entry.available)
                 })
-                .map(|(id, label, _, description)| (*id, *label, *description))
+                .map(|provider| (provider.id, provider.label, provider.description))
                 .collect();
         }
-        let available = PROVIDERS
-            .iter()
-            .filter(|(_, _, feature, _)| self.feature_enabled(feature))
-            .map(|(id, label, _, description)| (*id, *label, *description))
-            .collect::<Vec<_>>();
-        if available.is_empty() && self.server_info.is_none() {
-            vec![(PROVIDERS[0].0, PROVIDERS[0].1, PROVIDERS[0].3)]
-        } else {
-            available
-        }
+        Vec::new()
     }
 
     pub(super) fn provider_label(provider: &str) -> &str {
-        PROVIDERS
-            .iter()
-            .find(|(id, _, _, _)| *id == provider)
-            .map_or(provider, |(_, label, _, _)| *label)
+        provider_label(provider)
     }
 
     pub(super) fn feature_enabled(&self, feature: &str) -> bool {
@@ -428,6 +412,9 @@ impl ConnectionView {
 
     pub(super) fn ensure_selected_provider(&mut self) {
         let options = self.provider_options();
+        if options.is_empty() {
+            return;
+        }
         if !options
             .iter()
             .any(|(provider, _, _)| *provider == self.selected_provider)
@@ -439,10 +426,60 @@ impl ConnectionView {
         }
     }
 
+    pub(super) fn reconcile_project_providers(&mut self) {
+        let available = self
+            .provider_options()
+            .into_iter()
+            .map(|(provider, _, _)| provider)
+            .collect::<BTreeSet<_>>();
+        self.project_providers
+            .retain(|_, provider| available.contains(provider.as_str()));
+    }
+
     pub(super) fn provider_is_available(&self, provider: &str) -> bool {
         self.provider_options()
             .iter()
             .any(|(candidate, _, _)| *candidate == provider)
+    }
+
+    pub(super) fn provider_prompt_blocker(&self, provider: &str) -> Option<String> {
+        if self.provider_catalog.is_none() {
+            return Some("正在读取 Daemon 的模型目录，请稍候".into());
+        }
+        if self.provider_catalog_error.is_some()
+            && self
+                .provider_catalog
+                .as_ref()
+                .is_none_or(|catalog| catalog.providers.is_empty())
+        {
+            return Some("模型目录读取失败，请重新连接 Daemon 后重试".into());
+        }
+        let entry = self
+            .provider_catalog
+            .as_ref()?
+            .providers
+            .iter()
+            .find(|entry| entry.provider_id == provider);
+        match entry {
+            Some(entry)
+                if entry.available
+                    && (!provider_supports_turn_options(provider) || !entry.models.is_empty()) =>
+            {
+                None
+            }
+            Some(entry) if entry.available => Some(format!(
+                "{} 当前没有报告可用模型，请刷新模型目录后重试",
+                Self::provider_label(provider)
+            )),
+            Some(entry) => Some(entry.reason.as_deref().map_or_else(
+                || format!("{} 当前不可用", Self::provider_label(provider)),
+                |reason| format!("{} 当前不可用：{reason}", Self::provider_label(provider)),
+            )),
+            None => Some(format!(
+                "Daemon 未报告 {} Provider，请切换到可用 Provider",
+                Self::provider_label(provider)
+            )),
+        }
     }
 
     pub(super) fn project_provider(&self, project_id: &str) -> String {
@@ -467,6 +504,129 @@ impl ConnectionView {
             || self.selected_provider.clone(),
             |project_id| self.project_provider(project_id),
         )
+    }
+
+    fn new_task_model_info(
+        &self,
+        project_id: &str,
+        provider: &str,
+    ) -> Option<&corbit_client::ProviderModelInfo> {
+        let entry = self
+            .provider_catalog
+            .as_ref()?
+            .providers
+            .iter()
+            .find(|entry| entry.provider_id == provider && entry.available)?;
+        self.composer_selections.project_model(project_id, entry)
+    }
+
+    fn new_task_reasoning_effort(
+        &self,
+        project_id: &str,
+        provider: &str,
+    ) -> Option<corbit_client::AgentReasoningEffort> {
+        let entry = self
+            .provider_catalog
+            .as_ref()?
+            .providers
+            .iter()
+            .find(|entry| entry.provider_id == provider && entry.available)?;
+        self.composer_selections
+            .project_reasoning_effort(project_id, entry)
+    }
+
+    fn new_task_prompt_options(
+        &self,
+        project_id: &str,
+        provider: &str,
+    ) -> corbit_client::AgentPromptOptions {
+        let supports_turn_options = provider_supports_turn_options(provider);
+        corbit_client::AgentPromptOptions {
+            model: supports_turn_options
+                .then(|| {
+                    self.new_task_model_info(project_id, provider)
+                        .map(|model| model.id.clone())
+                })
+                .flatten(),
+            permission_mode: supports_turn_options
+                .then_some(corbit_client::AgentPermissionMode::WorkspaceWrite),
+            reasoning_effort: supports_turn_options
+                .then(|| self.new_task_reasoning_effort(project_id, provider))
+                .flatten(),
+            attachments: Vec::new(),
+        }
+    }
+
+    fn choose_new_task_model(
+        &mut self,
+        project_id: &str,
+        provider: &str,
+        model: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = self.provider_catalog.as_ref().and_then(|catalog| {
+            catalog
+                .providers
+                .iter()
+                .find(|entry| entry.provider_id == provider && entry.available)
+                .cloned()
+        });
+        if entry.is_some_and(|entry| {
+            self.composer_selections
+                .choose_project_model(project_id, &entry, model)
+        }) {
+            self.schedule_ui_state_save(cx);
+            cx.notify();
+        }
+    }
+
+    fn choose_new_task_reasoning_effort(
+        &mut self,
+        project_id: &str,
+        provider: &str,
+        effort: corbit_client::AgentReasoningEffort,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = self.provider_catalog.as_ref().and_then(|catalog| {
+            catalog
+                .providers
+                .iter()
+                .find(|entry| entry.provider_id == provider && entry.available)
+                .cloned()
+        });
+        if entry.is_some_and(|entry| {
+            self.composer_selections
+                .choose_project_reasoning_effort(project_id, &entry, effort)
+        }) {
+            self.schedule_ui_state_save(cx);
+            cx.notify();
+        }
+    }
+
+    fn remember_new_task_agent_selection(
+        &mut self,
+        agent_id: &str,
+        provider: &str,
+        options: Option<&corbit_client::AgentPromptOptions>,
+    ) {
+        let Some(options) = options else {
+            return;
+        };
+        let entry = self.provider_catalog.as_ref().and_then(|catalog| {
+            catalog
+                .providers
+                .iter()
+                .find(|entry| entry.provider_id == provider && entry.available)
+                .cloned()
+        });
+        if let Some(entry) = entry {
+            self.composer_selections.set_agent_selection(
+                agent_id,
+                &entry,
+                options.model.as_deref(),
+                options.reasoning_effort,
+            );
+        }
     }
 
     pub(super) fn set_project_provider_preference(
@@ -545,8 +705,8 @@ impl ConnectionView {
             }
         };
         let provider = self.project_provider(&location.project_id);
-        if !self.provider_is_available(&provider) {
-            self.show_validation_error("所选模型提供商当前不可用", cx);
+        if let Some(message) = self.provider_prompt_blocker(&provider) {
+            self.show_validation_error(message, cx);
             return;
         }
         if !matches!(self.state, corbit_client::ConnectionState::Online) {
@@ -569,6 +729,8 @@ impl ConnectionView {
         } else {
             NewTaskRecoveryStage::Workspace
         };
+        let prompt_options = provider_supports_turn_options(&provider)
+            .then(|| self.new_task_prompt_options(&location.project_id, &provider));
         let recovery = PendingNewTaskRecovery {
             project_id: Some(location.project_id),
             workspace_id: location.workspace_id,
@@ -577,6 +739,7 @@ impl ConnectionView {
             provider,
             title,
             prompt,
+            prompt_options,
             agent_id: None,
             stage,
             workspace_create_mutation_id: format!("new_task_workspace_{}", uuid::Uuid::new_v4()),
@@ -636,10 +799,17 @@ impl ConnectionView {
                         agent_id,
                         snapshot,
                         turn_id,
+                        provider,
+                        prompt_options,
                     } => {
                         if let Some(snapshot) = snapshot {
                             view.snapshot = Some(snapshot);
                         }
+                        view.remember_new_task_agent_selection(
+                            &agent_id,
+                            &provider,
+                            prompt_options.as_ref(),
+                        );
                         view.selected_agent_id = Some(agent_id);
                         view.reconcile_selection();
                         view.main_section = MainSection::Conversation;
@@ -662,6 +832,11 @@ impl ConnectionView {
                         }
                         view.reconcile_selection();
                         if let Some(agent_id) = recovery.agent_id.clone() {
+                            view.remember_new_task_agent_selection(
+                                &agent_id,
+                                &recovery.provider,
+                                recovery.prompt_options.as_ref(),
+                            );
                             view.selected_agent_id = Some(agent_id);
                             view.reconcile_selection();
                             view.main_section = MainSection::Conversation;
@@ -963,12 +1138,178 @@ impl ConnectionView {
                     }))
             })
             .collect::<Vec<_>>();
+        let selected_project_id = self.selected_project_id.clone();
+        let prompt_blocker = self.provider_prompt_blocker(&selected_project_provider);
+        let supports_turn_options = provider_supports_turn_options(&selected_project_provider);
+        let selected_model = selected_project_id
+            .as_deref()
+            .and_then(|project_id| self.new_task_model_info(project_id, &selected_project_provider))
+            .cloned();
+        let model_label = selected_model.as_ref().map_or_else(
+            || {
+                if prompt_blocker.is_some() {
+                    "模型不可用".to_owned()
+                } else {
+                    "Provider 默认".to_owned()
+                }
+            },
+            |model| model.display_name.clone(),
+        );
+        let model_choices =
+            self.provider_catalog
+                .as_ref()
+                .and_then(|catalog| {
+                    catalog.providers.iter().find(|entry| {
+                        entry.provider_id == selected_project_provider && entry.available
+                    })
+                })
+                .map(|entry| entry.models.clone())
+                .unwrap_or_default();
+        let model_view = cx.entity();
+        let model_project_id = selected_project_id.clone().unwrap_or_default();
+        let model_provider = selected_project_provider.clone();
+        let selected_model_for_menu = selected_model.clone();
+        let model_button = Button::new("new-task-model")
+            .outline()
+            .small()
+            .label(model_label)
+            .dropdown_caret(true)
+            .tooltip(if supports_turn_options {
+                "选择首次 Prompt 使用的模型"
+            } else {
+                "当前 Provider 使用自己的默认模型"
+            })
+            .disabled(
+                !is_online
+                    || self.new_task_in_flight
+                    || self.new_task_recovery.is_some()
+                    || selected_project_id.is_none()
+                    || !supports_turn_options
+                    || model_choices.is_empty(),
+            )
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.min_w(px(260.)).max_w(px(420.));
+                for model in model_choices.clone() {
+                    let item_view = model_view.clone();
+                    let item_project_id = model_project_id.clone();
+                    let item_provider = model_provider.clone();
+                    let item_model = model.id.clone();
+                    let checked = selected_model_for_menu
+                        .as_ref()
+                        .is_some_and(|selected| selected.id == model.id);
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .v_flex()
+                                .min_w_0()
+                                .py_1()
+                                .child(
+                                    div()
+                                        .text_size(font_px(FONT_SIZE_SM))
+                                        .font_medium()
+                                        .child(model.display_name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(font_px(FONT_SIZE_XS))
+                                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                                        .child(model.description.clone()),
+                                )
+                        })
+                        .checked(checked)
+                        .on_click(move |_, _, cx| {
+                            item_view.update(cx, |view, cx| {
+                                view.choose_new_task_model(
+                                    &item_project_id,
+                                    &item_provider,
+                                    &item_model,
+                                    cx,
+                                );
+                            });
+                        }),
+                    );
+                }
+                menu
+            });
+        let reasoning_effort = selected_project_id.as_deref().and_then(|project_id| {
+            self.new_task_reasoning_effort(project_id, &selected_project_provider)
+        });
+        let reasoning_choices = selected_model
+            .as_ref()
+            .map(|model| model.supported_reasoning_efforts.clone())
+            .unwrap_or_default();
+        let reasoning_view = cx.entity();
+        let reasoning_project_id = selected_project_id.clone().unwrap_or_default();
+        let reasoning_provider = selected_project_provider.clone();
+        let reasoning_button = Button::new("new-task-reasoning")
+            .outline()
+            .small()
+            .label(reasoning_effort.map_or("默认推理", reasoning_effort_label))
+            .dropdown_caret(true)
+            .tooltip(if supports_turn_options {
+                "选择首次 Prompt 的推理程度"
+            } else {
+                "当前 Provider 管理自己的推理程度"
+            })
+            .disabled(
+                !is_online
+                    || self.new_task_in_flight
+                    || self.new_task_recovery.is_some()
+                    || selected_project_id.is_none()
+                    || !supports_turn_options
+                    || reasoning_choices.is_empty(),
+            )
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.min_w(px(240.)).max_w(px(360.));
+                for choice in reasoning_choices.clone() {
+                    let effort = choice.reasoning_effort;
+                    let item_view = reasoning_view.clone();
+                    let item_project_id = reasoning_project_id.clone();
+                    let item_provider = reasoning_provider.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            div()
+                                .v_flex()
+                                .min_w_0()
+                                .py_1()
+                                .child(
+                                    div()
+                                        .text_size(font_px(FONT_SIZE_SM))
+                                        .font_medium()
+                                        .child(reasoning_effort_short_label(effort)),
+                                )
+                                .when_some(choice.description.clone(), |item, description| {
+                                    item.child(
+                                        div()
+                                            .text_size(font_px(FONT_SIZE_XS))
+                                            .text_color(rgb(COLOR_TEXT_SECONDARY))
+                                            .child(description),
+                                    )
+                                })
+                        })
+                        .checked(reasoning_effort == Some(effort))
+                        .on_click(move |_, _, cx| {
+                            item_view.update(cx, |view, cx| {
+                                view.choose_new_task_reasoning_effort(
+                                    &item_project_id,
+                                    &item_provider,
+                                    effort,
+                                    cx,
+                                );
+                            });
+                        }),
+                    );
+                }
+                menu
+            });
         let can_create = is_online
             && !self.new_task_in_flight
             && self.new_task_recovery.is_none()
             && selected_project.is_some()
             && has_providers
+            && prompt_blocker.is_none()
             && !self.new_task_prompt.read(cx).value().trim().is_empty();
+        let new_task_hint = prompt_blocker.unwrap_or(selected_provider_description);
         let recovery_banner = self.render_new_task_recovery_banner(is_online, cx);
         let has_workspaces = !workspaces.is_empty();
         let project_card = match selected_project.as_ref() {
@@ -1093,6 +1434,8 @@ impl ConnectionView {
                                             )
                                             .children(providers),
                                     )
+                                    .child(model_button)
+                                    .child(reasoning_button)
                                     .child(
                                         Button::new("start-new-task")
                                             .primary()
@@ -1111,7 +1454,7 @@ impl ConnectionView {
                                     .text_size(font_px(FONT_SIZE_XS))
                                     .text_color(rgb(COLOR_TEXT_TERTIARY))
                                     .child(format!(
-                                        "{selected_provider_description} · 提交后自动创建并启动，无需预先选择 Agent"
+                                        "{new_task_hint} · 提交后自动创建并启动，无需预先选择 Agent"
                                     )),
                             ),
                     )
@@ -1483,6 +1826,12 @@ mod tests {
             provider: "codex".into(),
             title: "继续完成界面逻辑".into(),
             prompt: "完成任务恢复流程并补齐测试".into(),
+            prompt_options: Some(corbit_client::AgentPromptOptions {
+                model: Some("gpt-5.4".into()),
+                permission_mode: Some(corbit_client::AgentPermissionMode::WorkspaceWrite),
+                reasoning_effort: Some(corbit_client::AgentReasoningEffort::High),
+                attachments: Vec::new(),
+            }),
             agent_id: Some("agent-1".into()),
             stage: NewTaskRecoveryStage::Prompt,
             workspace_create_mutation_id: "workspace-fixed".into(),
@@ -1505,6 +1854,13 @@ mod tests {
         assert_eq!(decoded.prompt_mutation_id, "prompt-fixed");
         assert_eq!(decoded.cleanup_stop_mutation_id, "cleanup-stop-fixed");
         assert_eq!(decoded.cleanup_delete_mutation_id, "cleanup-delete-fixed");
+        assert_eq!(
+            decoded
+                .prompt_options
+                .as_ref()
+                .and_then(|options| options.model.as_deref()),
+            Some("gpt-5.4")
+        );
     }
 
     #[test]
@@ -1530,6 +1886,7 @@ mod tests {
         assert_eq!(decoded.project_id, None);
         assert_eq!(decoded.workspace_id.as_deref(), Some("workspace-1"));
         assert!(decoded.workspace_create_mutation_id.is_empty());
+        assert_eq!(decoded.prompt_options, None);
     }
 
     #[test]

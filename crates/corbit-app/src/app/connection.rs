@@ -234,12 +234,15 @@ pub(super) fn is_loopback_endpoint(endpoint: &str) -> bool {
 }
 
 fn local_daemon_credentials_path() -> anyhow::Result<PathBuf> {
-    Ok(resolve_local_daemon_home(
+    Ok(local_daemon_home()?.join(DAEMON_CREDENTIALS_FILE))
+}
+
+pub(super) fn local_daemon_home() -> anyhow::Result<PathBuf> {
+    resolve_local_daemon_home(
         environment_value(CORBIT_HOME_ENVIRONMENT).as_deref(),
         user_home_directory().as_deref(),
         env::current_dir().ok().as_deref(),
-    )?
-    .join(DAEMON_CREDENTIALS_FILE))
+    )
 }
 
 fn resolve_local_daemon_home(

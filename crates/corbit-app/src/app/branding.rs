@@ -95,6 +95,7 @@ const EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     embedded_icon!("sun"),
     embedded_icon!("trash-2"),
     embedded_icon!("user"),
+    embedded_icon!("workflow"),
     embedded_icon!("wrench"),
     embedded_icon!("x"),
 ];
@@ -140,6 +141,7 @@ pub(crate) enum AppIcon {
     Tasks,
     Terminal,
     Tool,
+    ToolCall,
     User,
     Workspace,
 }
@@ -182,6 +184,7 @@ impl AppIcon {
         Self::Tasks,
         Self::Terminal,
         Self::Tool,
+        Self::ToolCall,
         Self::User,
         Self::Workspace,
     ];
@@ -222,6 +225,7 @@ impl AppIcon {
             Self::Tasks => "icons/list-todo.svg",
             Self::Terminal => "icons/square-terminal.svg",
             Self::Tool => "icons/wrench.svg",
+            Self::ToolCall => "icons/workflow.svg",
             Self::User => "icons/user.svg",
             Self::Workspace => "icons/panels-top-left.svg",
         }

@@ -502,6 +502,176 @@ pub struct ProviderReasoningEffortInfo {
     pub description: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginRuntime {
+    Builtin,
+    Process,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PluginPermission {
+    #[serde(rename = "workspace.read")]
+    WorkspaceRead,
+    #[serde(rename = "workspace.write")]
+    WorkspaceWrite,
+    #[serde(rename = "network")]
+    Network,
+    #[serde(rename = "process")]
+    Process,
+    #[serde(rename = "secrets")]
+    Secrets,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginCommand {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginCapabilityUsage {
+    pub capability: String,
+    pub request_count: u32,
+    pub success_count: u32,
+    pub failure_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginAuditStatus {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginAuditEntry {
+    pub id: String,
+    pub plugin_id: String,
+    pub command_id: String,
+    pub started_at: String,
+    pub completed_at: String,
+    pub status: PluginAuditStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub capability_usage: Vec<PluginCapabilityUsage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginCommandResult {
+    pub plugin_id: String,
+    pub command_id: String,
+    pub message: String,
+    #[serde(default)]
+    pub capability_usage: Vec<PluginCapabilityUsage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginEntrypoint {
+    pub command: String,
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<PluginEntrypointProtocol>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginEntrypointProtocol {
+    Jsonl,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginManifest {
+    pub schema_version: u32,
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub publisher: String,
+    pub description: String,
+    pub runtime: PluginRuntime,
+    pub api_version: u32,
+    pub permissions: Vec<PluginPermission>,
+    pub entrypoint: Option<PluginEntrypoint>,
+    pub commands: Vec<PluginCommand>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRecord {
+    pub manifest: PluginManifest,
+    pub source: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub unavailable_permissions: Vec<PluginPermission>,
+    pub installed_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginSourceKind {
+    Directory,
+    Archive,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginInspectionOperation {
+    #[default]
+    Install,
+    Update,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInspection {
+    pub inspection_id: String,
+    pub plugin_id: String,
+    pub manifest: PluginManifest,
+    pub source_kind: PluginSourceKind,
+    #[serde(default)]
+    pub operation: PluginInspectionOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default)]
+    pub permission_escalation: Vec<PluginPermission>,
+    #[serde(default)]
+    pub unavailable_permissions: Vec<PluginPermission>,
+    pub source_fingerprint: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
+pub struct PluginMarketplaceEntry {
+    pub manifest: PluginManifest,
+    pub installed: bool,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default)]
+    pub update_available: bool,
+    #[serde(default)]
+    pub permission_escalation: Vec<PluginPermission>,
+    #[serde(default)]
+    pub unavailable_permissions: Vec<PluginPermission>,
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub package_url: Option<String>,
+    #[serde(default)]
+    pub key_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceCredentialSummary {
@@ -526,6 +696,8 @@ pub struct PairingOffer {
     pub server_id: String,
     pub host_name: String,
     pub expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_certificate_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -931,6 +1103,229 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn plugin_models_decode_optional_command_descriptions_and_results() {
+        let plugin: super::PluginRecord = serde_json::from_value(serde_json::json!({
+            "manifest": {
+                "schemaVersion": 1,
+                "id": "com.example.insights",
+                "name": "Insights",
+                "version": "1.0.0",
+                "publisher": "Example",
+                "description": "Example plugin",
+                "runtime": "process",
+                "apiVersion": 1,
+                "permissions": ["workspace.read"],
+                "entrypoint": { "command": "plugin.js", "args": [] },
+                "commands": [{ "id": "insights.scan", "name": "Scan" }]
+            },
+            "source": "local",
+            "enabled": true
+        }))
+        .expect("plugin record should match the daemon response");
+        assert!(plugin.unavailable_permissions.is_empty());
+        assert_eq!(plugin.manifest.commands[0].description, None);
+        assert_eq!(
+            plugin
+                .manifest
+                .entrypoint
+                .as_ref()
+                .and_then(|entrypoint| entrypoint.protocol.as_ref()),
+            None
+        );
+
+        let jsonl_entrypoint: super::PluginEntrypoint = serde_json::from_value(serde_json::json!({
+            "command": "plugin.js",
+            "args": [],
+            "protocol": "jsonl"
+        }))
+        .expect("JSONL plugin entrypoints should match the daemon model");
+        assert_eq!(
+            jsonl_entrypoint.protocol,
+            Some(super::PluginEntrypointProtocol::Jsonl)
+        );
+
+        let manifest = serde_json::to_value(&plugin.manifest).expect("manifest should serialize");
+        let current_plugin: super::PluginRecord = serde_json::from_value(serde_json::json!({
+            "manifest": manifest.clone(),
+            "source": "local",
+            "enabled": true,
+            "unavailablePermissions": ["network"]
+        }))
+        .expect("current plugin records should expose unavailable host permissions");
+        assert_eq!(
+            current_plugin.unavailable_permissions,
+            vec![super::PluginPermission::Network]
+        );
+
+        let inspection: super::PluginInspection = serde_json::from_value(serde_json::json!({
+            "inspectionId": "inspection_1",
+            "pluginId": "com.example.insights",
+            "manifest": manifest.clone(),
+            "sourceKind": "archive",
+            "sourceFingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "expiresAt": "2026-08-22T00:05:00.000Z"
+        }))
+        .expect("plugin inspection should match the daemon response");
+        assert_eq!(inspection.plugin_id, "com.example.insights");
+        assert_eq!(inspection.source_kind, super::PluginSourceKind::Archive);
+        assert_eq!(
+            inspection.operation,
+            super::PluginInspectionOperation::Install
+        );
+        assert_eq!(inspection.installed_version, None);
+        assert!(inspection.permission_escalation.is_empty());
+        assert!(inspection.unavailable_permissions.is_empty());
+        assert_eq!(inspection.manifest.commands[0].id, "insights.scan");
+
+        let update_inspection: super::PluginInspection =
+            serde_json::from_value(serde_json::json!({
+                "inspectionId": "inspection_2",
+                "pluginId": "com.example.insights",
+                "manifest": manifest.clone(),
+                "sourceKind": "directory",
+                "operation": "update",
+                "installedVersion": "1.0.0",
+                "permissionEscalation": ["network"],
+                "unavailablePermissions": ["network"],
+                "sourceFingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "expiresAt": "2026-08-22T00:05:00.000Z"
+            }))
+            .expect("plugin update inspection should match the daemon response");
+        assert_eq!(
+            update_inspection.operation,
+            super::PluginInspectionOperation::Update
+        );
+        assert_eq!(
+            update_inspection.installed_version.as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            update_inspection.permission_escalation,
+            vec![super::PluginPermission::Network]
+        );
+        assert_eq!(
+            update_inspection.unavailable_permissions,
+            vec![super::PluginPermission::Network]
+        );
+
+        let legacy_marketplace: super::PluginMarketplaceEntry =
+            serde_json::from_value(serde_json::json!({
+                "manifest": manifest.clone(),
+                "installed": false,
+                "enabled": false
+            }))
+            .expect("legacy marketplace entries should remain compatible");
+        assert_eq!(legacy_marketplace.installed_version, None);
+        assert!(!legacy_marketplace.update_available);
+        assert!(legacy_marketplace.permission_escalation.is_empty());
+        assert!(legacy_marketplace.unavailable_permissions.is_empty());
+        assert!(!legacy_marketplace.verified);
+        assert_eq!(legacy_marketplace.package_url, None);
+        assert_eq!(legacy_marketplace.key_id, None);
+
+        let verified_marketplace: super::PluginMarketplaceEntry =
+            serde_json::from_value(serde_json::json!({
+                "manifest": manifest,
+                "installed": false,
+                "enabled": false,
+                "verified": true,
+                "packageUrl": "https://plugins.example.test/insights.corbit-plugin",
+                "keyId": "example-publisher"
+            }))
+            .expect("signed marketplace entries should match the daemon response");
+        assert!(verified_marketplace.verified);
+        assert_eq!(
+            verified_marketplace.package_url.as_deref(),
+            Some("https://plugins.example.test/insights.corbit-plugin")
+        );
+        assert_eq!(
+            verified_marketplace.key_id.as_deref(),
+            Some("example-publisher")
+        );
+
+        let update: super::PluginMarketplaceEntry = serde_json::from_value(serde_json::json!({
+            "manifest": manifest,
+            "installed": true,
+            "enabled": false,
+            "installedVersion": "1.0.0",
+            "updateAvailable": true,
+            "permissionEscalation": ["network"],
+            "verified": true
+        }))
+        .expect("plugin marketplace updates should match the daemon response");
+        assert_eq!(update.installed_version.as_deref(), Some("1.0.0"));
+        assert!(update.update_available);
+        assert_eq!(
+            update.permission_escalation,
+            vec![super::PluginPermission::Network]
+        );
+
+        let legacy_result: super::PluginCommandResult = serde_json::from_value(serde_json::json!({
+            "pluginId": "com.example.insights",
+            "commandId": "insights.scan",
+            "message": "legacy"
+        }))
+        .expect("legacy plugin command results should remain compatible");
+        assert!(legacy_result.capability_usage.is_empty());
+
+        let result: super::PluginCommandResult = serde_json::from_value(serde_json::json!({
+            "pluginId": "com.example.insights",
+            "commandId": "insights.scan",
+            "message": "done",
+            "capabilityUsage": [{
+                "capability": "workspace.read",
+                "requestCount": 2,
+                "successCount": 1,
+                "failureCount": 1
+            }]
+        }))
+        .expect("plugin command result should match the daemon response");
+        assert_eq!(result.message, "done");
+        assert_eq!(result.capability_usage[0].request_count, 2);
+    }
+
+    #[test]
+    fn plugin_audit_entries_decode_success_failure_and_capability_usage() {
+        let entries: Vec<super::PluginAuditEntry> = serde_json::from_value(serde_json::json!([
+            {
+                "id": "audit_success",
+                "pluginId": "com.example.insights",
+                "commandId": "insights.scan",
+                "startedAt": "2026-08-22T00:00:00.000Z",
+                "completedAt": "2026-08-22T00:00:01.000Z",
+                "status": "succeeded",
+                "capabilityUsage": [{
+                    "capability": "workspace.read",
+                    "requestCount": 2,
+                    "successCount": 1,
+                    "failureCount": 1
+                }]
+            },
+            {
+                "id": "audit_failure",
+                "pluginId": "com.example.insights",
+                "commandId": "insights.scan",
+                "startedAt": "2026-08-22T00:00:02.000Z",
+                "completedAt": "2026-08-22T00:00:03.000Z",
+                "status": "failed",
+                "errorCode": "plugin_protocol_error"
+            }
+        ]))
+        .expect("plugin audit entries should match the daemon response");
+
+        assert_eq!(entries[0].status, super::PluginAuditStatus::Succeeded);
+        assert_eq!(entries[0].error_code, None);
+        assert_eq!(entries[0].capability_usage[0].failure_count, 1);
+        assert_eq!(entries[1].status, super::PluginAuditStatus::Failed);
+        assert_eq!(
+            entries[1].error_code.as_deref(),
+            Some("plugin_protocol_error")
+        );
+        assert!(entries[1].capability_usage.is_empty());
+    }
+
+    #[test]
     fn resource_mutation_fixtures_have_strongly_typed_acknowledgements() {
         for relative_path in [
             "resources/project-create-response.json",
@@ -1019,11 +1414,16 @@ mod tests {
             "endpoint": "https://corbit.example.test",
             "serverId": "server_1",
             "hostName": "Development Mac",
-            "expiresAt": "2026-08-16T00:05:00.000Z"
+            "expiresAt": "2026-08-16T00:05:00.000Z",
+            "tlsCertificateSha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         }))
         .expect("pairing offer should match the daemon model");
         assert_eq!(offer.server_id, "server_1");
         assert_eq!(offer.host_name, "Development Mac");
+        assert_eq!(
+            offer.tls_certificate_sha256.as_deref(),
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     fn fixture_result(relative_path: &str) -> serde_json::Value {

@@ -1,10 +1,33 @@
-use super::*;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::{DateTime, Utc};
-use gpui::ease_out_quint;
+mod composer;
+mod index;
+mod lifecycle;
+mod model;
+mod provider_switch;
 
-const CONVERSATION_INDEX_MAX_MARKERS: usize = 32;
-const CONVERSATION_INDEX_ANIMATION_DURATION: Duration = Duration::from_millis(180);
+use super::*;
+use chrono::{DateTime, Utc};
+use composer::{
+    MAX_PROMPT_ATTACHMENTS, attachment_size_label, context_window_percent, load_prompt_attachments,
+    permission_mode_copy,
+};
+use gpui::ease_out_quint;
+pub(super) use index::ConversationIndexInteraction;
+use index::{
+    CONVERSATION_INDEX_ANIMATION_DURATION, active_turn_indicator_dot_opacity,
+    closest_conversation_index_entry, conversation_index_entries,
+    conversation_index_marker_metrics, interpolate_rgba, scroll_timeline_to_latest,
+};
+use lifecycle::{
+    apply_turn_completed_event, apply_turn_started_event, is_permission_placeholder,
+    remember_turn_provider,
+};
+pub(super) use model::{
+    ComposerAttachment, PendingPermission, RetryControl, RetryPrompt, TimelineIndex,
+    TimelineStatus, TimelineTurn,
+};
+use model::{TimelineStep, TimelineStepKind, TimelineUsage};
+use provider_switch::{ProviderSwitchFailure, execute_provider_switch};
+
 const ACTIVE_TURN_INDICATOR_ANIMATION_DURATION: Duration = Duration::from_millis(1_100);
 const STREAMING_RESPONSE_PREVIEW_BYTES: usize = 12 * 1024;
 const LONG_RESPONSE_VIRTUALIZATION_BYTES: usize = 24 * 1024;
@@ -12,9 +35,6 @@ const LONG_RESPONSE_VIEW_HEIGHT: f32 = 560.;
 const CONVERSATION_BODY_FONT_SIZE: f32 = 15.;
 const CONVERSATION_BODY_LINE_HEIGHT: f32 = 24.;
 const CONVERSATION_PARAGRAPH_GAP_REMS: f32 = 0.75;
-const MAX_PROMPT_ATTACHMENTS: usize = 3;
-const MAX_PROMPT_ATTACHMENT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_PROMPT_ATTACHMENTS_TOTAL_BYTES: usize = 5 * 1024 * 1024;
 
 fn conversation_markdown_style() -> TextViewStyle {
     let mut style = TextViewStyle::default()
@@ -45,151 +65,48 @@ fn should_virtualize_response(response: &str) -> bool {
     response.len() >= LONG_RESPONSE_VIRTUALIZATION_BYTES
 }
 
-fn is_permission_placeholder(turn: &TimelineTurn) -> bool {
-    turn.prompt.is_empty()
-        && turn.response.is_empty()
-        && turn.steps.is_empty()
-        && turn.diff.is_none()
-        && turn.usage.is_none()
-        && turn.started_at.is_none()
-        && turn.completed_at.is_none()
-        && turn.duration_ms.is_none()
-        && turn.error.is_none()
+fn final_response_step(turn: &TimelineTurn) -> Option<(usize, &str)> {
+    let (index, text) =
+        turn.steps
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, step)| match &step.kind {
+                TimelineStepKind::AssistantMessage { text } => Some((index, text.as_str())),
+                _ => None,
+            })?;
+
+    (turn.steps[index + 1..].is_empty() && !text.trim().is_empty()).then_some((index, text))
 }
 
-fn remember_turn_provider(turn: &mut TimelineTurn, provider: Option<&str>) {
-    if turn.provider.is_none() {
-        turn.provider = provider
-            .filter(|provider| !provider.is_empty())
-            .map(str::to_owned);
-    }
+fn final_response(turn: &TimelineTurn) -> Option<&str> {
+    final_response_step(turn).map(|(_, response)| response)
 }
 
-fn apply_turn_started_event(turn: &mut TimelineTurn, prompt: String, occurred_at: String) {
-    if turn.status != TimelineStatus::InProgress {
-        return;
+fn tool_display_title(raw: &str) -> String {
+    if !raw.contains(['_', '-', '.']) {
+        return raw.to_owned();
     }
 
-    turn.prompt = prompt;
-    turn.error = None;
-    turn.started_at = Some(occurred_at);
-    turn.completed_at = None;
-    turn.duration_ms = None;
-}
-
-fn conversation_index_entries(turn_count: usize) -> Vec<usize> {
-    if turn_count <= CONVERSATION_INDEX_MAX_MARKERS {
-        return (0..turn_count).collect();
-    }
-
-    let last_turn = turn_count - 1;
-    (0..CONVERSATION_INDEX_MAX_MARKERS)
-        .map(|slot| slot * last_turn / (CONVERSATION_INDEX_MAX_MARKERS - 1))
-        .collect()
-}
-
-fn closest_conversation_index_entry(entries: &[usize], active_turn: usize) -> Option<usize> {
-    entries
-        .iter()
-        .copied()
-        .min_by_key(|entry| entry.abs_diff(active_turn))
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct ConversationIndexInteraction {
-    hovered: bool,
-    from_slot: Option<usize>,
-    to_slot: Option<usize>,
-    animation_generation: u64,
-}
-
-impl ConversationIndexInteraction {
-    fn set_hovered(&mut self, hovered: bool) -> bool {
-        if self.hovered == hovered {
-            return false;
-        }
-
-        self.hovered = hovered;
-        if hovered {
-            self.from_slot = None;
-            self.to_slot = None;
-        } else {
-            self.from_slot = self.to_slot;
-            self.to_slot = None;
-        }
-        self.animation_generation = self.animation_generation.wrapping_add(1);
-        true
-    }
-
-    fn focus_slot(&mut self, slot: usize) -> bool {
-        if self.hovered && self.to_slot == Some(slot) {
-            return false;
-        }
-
-        self.from_slot = self.hovered.then_some(self.to_slot).flatten();
-        self.to_slot = Some(slot);
-        self.hovered = true;
-        self.animation_generation = self.animation_generation.wrapping_add(1);
-        true
-    }
-
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct ConversationIndexMarkerMetrics {
-    width: f32,
-    emphasis: f32,
-}
-
-fn conversation_index_marker_metrics(
-    is_active: bool,
-    marker_slot: usize,
-    focus_slot: Option<usize>,
-) -> ConversationIndexMarkerMetrics {
-    let base_width = if is_active { 16. } else { 8. };
-    let expanded_width = if is_active { 22. } else { 20. };
-    let emphasis = focus_slot.map_or(0., |focus_slot| match marker_slot.abs_diff(focus_slot) {
-        0 => 1.,
-        1 => 0.42,
-        2 => 0.16,
-        _ => 0.,
-    });
-
-    ConversationIndexMarkerMetrics {
-        width: base_width + (expanded_width - base_width) * emphasis,
-        emphasis,
-    }
-}
-
-fn interpolate_rgba(from: gpui::Rgba, to: gpui::Rgba, delta: f32) -> gpui::Rgba {
-    gpui::Rgba {
-        r: from.r + (to.r - from.r) * delta,
-        g: from.g + (to.g - from.g) * delta,
-        b: from.b + (to.b - from.b) * delta,
-        a: from.a + (to.a - from.a) * delta,
-    }
-}
-
-fn active_turn_indicator_dot_opacity(delta: f32, dot_index: u8) -> f32 {
-    let phase = (delta - f32::from(dot_index) * 0.18).rem_euclid(1.0);
-    let direct_distance = (phase - 0.32).abs();
-    let wrapped_distance = direct_distance.min(1.0 - direct_distance);
-    let pulse = (1.0 - wrapped_distance / 0.2).clamp(0.0, 1.0);
-    0.35 + pulse * pulse * 0.65
-}
-
-fn scroll_timeline_to_latest(list_state: &ListState) {
-    list_state.scroll_to(gpui::ListOffset {
-        item_ix: list_state.item_count(),
-        offset_in_item: px(0.),
-    });
-}
-
-fn composer_supports_turn_options(provider: &str) -> bool {
-    matches!(provider, "codex" | "claude")
+    raw.split(['_', '-', '.'])
+        .filter(|part| !part.is_empty())
+        .enumerate()
+        .map(|(index, part)| match part.to_ascii_lowercase().as_str() {
+            "openai" => "OpenAI".to_owned(),
+            "api" => "API".to_owned(),
+            "json" => "JSON".to_owned(),
+            "url" => "URL".to_owned(),
+            "id" => "ID".to_owned(),
+            _ if index == 0 => {
+                let mut chars = part.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            }
+            _ => part.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn composer_option_variant(cx: &App) -> ButtonCustomVariant {
@@ -207,147 +124,6 @@ fn composer_action_variant(cx: &App) -> ButtonCustomVariant {
         .active(rgb(COLOR_TEXT_TERTIARY).into())
 }
 
-fn context_window_percent(used_tokens: u64, context_window: u64) -> u8 {
-    if context_window == 0 {
-        return 0;
-    }
-
-    let used_tokens = u128::from(used_tokens);
-    let context_window = u128::from(context_window);
-    let rounded = (used_tokens * 100 + context_window / 2) / context_window;
-    rounded.min(100) as u8
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PermissionModeCopy {
-    title: &'static str,
-    description: &'static str,
-}
-
-fn permission_mode_copy(mode: corbit_client::AgentPermissionMode) -> PermissionModeCopy {
-    match mode {
-        corbit_client::AgentPermissionMode::ReadOnly => PermissionModeCopy {
-            title: "请求批准",
-            description: "编辑外部文件和使用互联网时始终询问",
-        },
-        corbit_client::AgentPermissionMode::WorkspaceWrite => PermissionModeCopy {
-            title: "帮我批准",
-            description: "仅对检测到的风险操作请求批准",
-        },
-        corbit_client::AgentPermissionMode::FullAccess => PermissionModeCopy {
-            title: "完全访问权限",
-            description: "可不受限制地访问互联网和你电脑上的任何文件",
-        },
-    }
-}
-
-fn reasoning_effort_label(effort: corbit_client::AgentReasoningEffort) -> &'static str {
-    match effort {
-        corbit_client::AgentReasoningEffort::Low => "低推理",
-        corbit_client::AgentReasoningEffort::Medium => "中推理",
-        corbit_client::AgentReasoningEffort::High => "高推理",
-        corbit_client::AgentReasoningEffort::Xhigh => "极高推理",
-        corbit_client::AgentReasoningEffort::Max => "最高推理",
-        corbit_client::AgentReasoningEffort::Ultra => "超强推理",
-    }
-}
-
-fn reasoning_effort_short_label(effort: corbit_client::AgentReasoningEffort) -> &'static str {
-    match effort {
-        corbit_client::AgentReasoningEffort::Low => "低",
-        corbit_client::AgentReasoningEffort::Medium => "中",
-        corbit_client::AgentReasoningEffort::High => "高",
-        corbit_client::AgentReasoningEffort::Xhigh => "极高",
-        corbit_client::AgentReasoningEffort::Max => "最高",
-        corbit_client::AgentReasoningEffort::Ultra => "超强",
-    }
-}
-
-fn attachment_size_label(size: usize) -> String {
-    format!("{} KB", size.div_ceil(1024))
-}
-
-fn load_prompt_attachments(
-    paths: Vec<PathBuf>,
-    available_slots: usize,
-    existing_bytes: usize,
-) -> Result<Vec<ComposerAttachment>, String> {
-    if paths.len() > available_slots {
-        return Err(format!(
-            "每条消息最多可添加 {MAX_PROMPT_ATTACHMENTS} 个附件"
-        ));
-    }
-    let mut total_bytes = existing_bytes;
-    paths
-        .into_iter()
-        .map(|path| {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| format!("附件名称无效：{}", path.display()))?
-                .to_owned();
-            let bytes =
-                std::fs::read(&path).map_err(|error| format!("无法读取附件 {name}：{error}"))?;
-            if bytes.len() > MAX_PROMPT_ATTACHMENT_BYTES {
-                return Err(format!("附件 {name} 超过 2 MB 上限"));
-            }
-            total_bytes += bytes.len();
-            if total_bytes > MAX_PROMPT_ATTACHMENTS_TOTAL_BYTES {
-                return Err("附件总大小不能超过 5 MB".to_owned());
-            }
-            let extension = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            let mime_type = match extension.as_str() {
-                "png" => "image/png",
-                "jpg" | "jpeg" => "image/jpeg",
-                "gif" => "image/gif",
-                "webp" => "image/webp",
-                _ => {
-                    std::str::from_utf8(&bytes)
-                        .map_err(|_| format!("附件 {name} 不是支持的图片或 UTF-8 文本文件"))?;
-                    "text/plain"
-                }
-            };
-            Ok(ComposerAttachment {
-                upload: corbit_client::AgentPromptAttachment {
-                    name,
-                    mime_type: mime_type.to_owned(),
-                    data_base64: STANDARD.encode(&bytes),
-                },
-                size_bytes: bytes.len(),
-            })
-        })
-        .collect()
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct RetryPrompt {
-    signature: String,
-    client_mutation_id: String,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct ComposerAttachment {
-    upload: corbit_client::AgentPromptAttachment,
-    size_bytes: usize,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct RetryControl {
-    signature: String,
-    client_mutation_id: String,
-}
-
-struct ProviderSwitchFailure {
-    message: String,
-    snapshot: Option<corbit_client::AuthoritativeSnapshot>,
-    provider_updated: bool,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ContextWindowUsage {
     used_tokens: u64,
@@ -358,211 +134,6 @@ impl ContextWindowUsage {
     fn percent(self) -> u8 {
         context_window_percent(self.used_tokens, self.context_window)
     }
-}
-
-async fn execute_provider_switch(
-    client: corbit_client::DaemonRuntimeClient,
-    agent: corbit_client::AgentResource,
-    provider: String,
-) -> Result<corbit_client::AuthoritativeSnapshot, ProviderSwitchFailure> {
-    let mut snapshot = None;
-    if agent.status == corbit_client::AgentStatus::Running {
-        match client
-            .mutate_and_snapshot(
-                "agent.stop",
-                json!({
-                    "agentId": agent.id.clone(),
-                    "clientMutationId": format!("provider_switch_stop_{}", uuid::Uuid::new_v4()),
-                }),
-            )
-            .await
-        {
-            Ok((_, stopped_snapshot)) => snapshot = Some(stopped_snapshot),
-            Err(error) => {
-                return Err(ProviderSwitchFailure {
-                    message: format!("停止原 Provider 会话失败：{error}"),
-                    snapshot: None,
-                    provider_updated: false,
-                });
-            }
-        }
-    }
-
-    if agent.provider != provider {
-        match client
-            .mutate_and_snapshot(
-                "agent.update",
-                json!({
-                    "agentId": agent.id.clone(),
-                    "provider": provider.clone(),
-                    "clientMutationId": format!("provider_switch_update_{}", uuid::Uuid::new_v4()),
-                }),
-            )
-            .await
-        {
-            Ok((_, updated_snapshot)) => snapshot = Some(updated_snapshot),
-            Err(error) => {
-                return Err(ProviderSwitchFailure {
-                    message: format!("更新 Agent Provider 失败：{error}"),
-                    snapshot,
-                    provider_updated: false,
-                });
-            }
-        }
-    }
-
-    match client
-        .mutate_and_snapshot(
-            "agent.start",
-            json!({
-                "agentId": agent.id.clone(),
-                "clientMutationId": format!("provider_switch_start_{}", uuid::Uuid::new_v4()),
-            }),
-        )
-        .await
-    {
-        Ok((_, running_snapshot)) => Ok(running_snapshot),
-        Err(error) => Err(ProviderSwitchFailure {
-            message: format!("新 Provider 会话启动失败：{error}"),
-            snapshot,
-            provider_updated: agent.provider != provider,
-        }),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TimelineStatus {
-    InProgress,
-    Completed,
-    Interrupted,
-    Failed,
-}
-
-#[derive(Clone, Debug)]
-pub(super) enum TimelineStepKind {
-    Reasoning {
-        text: String,
-    },
-    Plan {
-        explanation: Option<String>,
-        steps: Vec<corbit_client::AgentTimelinePlanStep>,
-    },
-    Command {
-        command: String,
-        cwd: Option<String>,
-        output: String,
-        exit_code: Option<i32>,
-        duration_ms: Option<u64>,
-    },
-    FileChange {
-        changes: Vec<corbit_client::AgentTimelineFileChange>,
-    },
-    Diff {
-        diff: String,
-    },
-    Tool {
-        tool_name: String,
-        title: Option<String>,
-        input: Option<String>,
-        output: Option<String>,
-        error: Option<String>,
-        duration_ms: Option<u64>,
-    },
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct TimelineStep {
-    pub(super) item_id: String,
-    pub(super) status: corbit_client::AgentTimelineStepStatus,
-    pub(super) kind: TimelineStepKind,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct TimelineUsage {
-    pub(super) input_tokens: u64,
-    pub(super) output_tokens: u64,
-    pub(super) total_tokens: u64,
-    pub(super) cached_input_tokens: Option<u64>,
-    pub(super) reasoning_output_tokens: Option<u64>,
-    pub(super) context_window: Option<u64>,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct TimelineTurn {
-    pub(super) agent_id: String,
-    pub(super) turn_id: String,
-    pub(super) provider: Option<String>,
-    pub(super) prompt: String,
-    pub(super) response: String,
-    pub(super) steps: Vec<TimelineStep>,
-    pub(super) diff: Option<String>,
-    pub(super) usage: Option<TimelineUsage>,
-    pub(super) started_at: Option<String>,
-    pub(super) completed_at: Option<String>,
-    pub(super) duration_ms: Option<u64>,
-    pub(super) status: TimelineStatus,
-    pub(super) error: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct TimelineLocation {
-    timeline_index: usize,
-    agent_index: usize,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct TimelineIndex {
-    by_turn: BTreeMap<String, BTreeMap<String, TimelineLocation>>,
-    by_agent: BTreeMap<String, Vec<usize>>,
-}
-
-impl TimelineIndex {
-    fn location(&self, agent_id: &str, turn_id: &str) -> Option<TimelineLocation> {
-        self.by_turn
-            .get(agent_id)
-            .and_then(|turns| turns.get(turn_id))
-            .copied()
-    }
-
-    fn insert(&mut self, agent_id: &str, turn_id: &str, timeline_index: usize) -> TimelineLocation {
-        if let Some(location) = self.location(agent_id, turn_id) {
-            return location;
-        }
-
-        let agent_turns = self.by_agent.entry(agent_id.to_owned()).or_default();
-        let location = TimelineLocation {
-            timeline_index,
-            agent_index: agent_turns.len(),
-        };
-        agent_turns.push(timeline_index);
-        self.by_turn
-            .entry(agent_id.to_owned())
-            .or_default()
-            .insert(turn_id.to_owned(), location);
-        location
-    }
-
-    fn agent_indices(&self, agent_id: &str) -> &[usize] {
-        self.by_agent.get(agent_id).map_or(&[], Vec::as_slice)
-    }
-
-    fn clear(&mut self) {
-        self.by_turn.clear();
-        self.by_agent.clear();
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct PendingPermission {
-    pub(super) agent_id: String,
-    pub(super) approval_id: String,
-    pub(super) turn_id: String,
-    pub(super) permission_kind: String,
-    pub(super) reason: Option<String>,
-    pub(super) command: Option<String>,
-    pub(super) cwd: Option<String>,
-    pub(super) grant_root: Option<String>,
-    pub(super) available_decisions: Vec<corbit_client::AgentApprovalDecision>,
 }
 
 impl ConnectionView {
@@ -579,9 +150,9 @@ impl ConnectionView {
 
     fn composer_model_info(&self, provider: &str) -> Option<&corbit_client::ProviderModelInfo> {
         let entry = self.provider_catalog_entry(provider)?;
-        self.composer_models
-            .get(provider)
-            .and_then(|selected| entry.models.iter().find(|model| model.id == *selected))
+        self.selected_agent_id
+            .as_deref()
+            .and_then(|agent_id| self.composer_selections.model(agent_id, entry))
             .or_else(|| entry.models.iter().find(|model| model.is_default))
             .or_else(|| entry.models.first())
     }
@@ -591,107 +162,45 @@ impl ConnectionView {
         provider: &str,
     ) -> Option<corbit_client::AgentReasoningEffort> {
         let model = self.composer_model_info(provider)?;
-        let supports = |effort| {
-            model
-                .supported_reasoning_efforts
-                .iter()
-                .any(|candidate| candidate.reasoning_effort == effort)
-        };
-        self.composer_reasoning_efforts
-            .get(provider)
-            .copied()
-            .filter(|effort| supports(*effort))
-            .or(model
-                .default_reasoning_effort
-                .filter(|effort| supports(*effort)))
-            .or_else(|| {
-                supports(corbit_client::AgentReasoningEffort::Medium)
-                    .then_some(corbit_client::AgentReasoningEffort::Medium)
-            })
-            .or_else(|| {
+        let entry = self.provider_catalog_entry(provider)?;
+        self.selected_agent_id
+            .as_deref()
+            .and_then(|agent_id| self.composer_selections.reasoning_effort(agent_id, entry))
+            .or(model.default_reasoning_effort.filter(|effort| {
                 model
                     .supported_reasoning_efforts
-                    .first()
-                    .map(|effort| effort.reasoning_effort)
-            })
+                    .iter()
+                    .any(|candidate| candidate.reasoning_effort == *effort)
+            }))
     }
 
     pub(super) fn reconcile_composer_catalog(&mut self) {
         let Some(catalog) = &self.provider_catalog else {
             return;
         };
-        let selections = catalog
-            .providers
-            .iter()
-            .filter(|provider| provider.available)
-            .filter_map(|provider| {
-                let model = self
-                    .composer_models
-                    .get(&provider.provider_id)
-                    .and_then(|selected| provider.models.iter().find(|model| model.id == *selected))
-                    .or_else(|| provider.models.iter().find(|model| model.is_default))
-                    .or_else(|| provider.models.first())?;
-                let selected_effort = self
-                    .composer_reasoning_efforts
-                    .get(&provider.provider_id)
-                    .copied()
-                    .filter(|selected| {
-                        model
-                            .supported_reasoning_efforts
-                            .iter()
-                            .any(|effort| effort.reasoning_effort == *selected)
-                    });
-                let effort = selected_effort
-                    .or(model.default_reasoning_effort)
-                    .filter(|selected| {
-                        model
-                            .supported_reasoning_efforts
-                            .iter()
-                            .any(|effort| effort.reasoning_effort == *selected)
-                    })
-                    .or_else(|| {
-                        model
-                            .supported_reasoning_efforts
-                            .iter()
-                            .find(|effort| {
-                                effort.reasoning_effort
-                                    == corbit_client::AgentReasoningEffort::Medium
-                            })
-                            .map(|effort| effort.reasoning_effort)
-                    })
-                    .or_else(|| {
-                        model
-                            .supported_reasoning_efforts
-                            .first()
-                            .map(|effort| effort.reasoning_effort)
-                    });
-                Some((provider.provider_id.clone(), model.id.clone(), effort))
-            })
-            .collect::<Vec<_>>();
-        for (provider, model, effort) in selections {
-            self.composer_models.insert(provider.clone(), model);
-            if let Some(effort) = effort {
-                self.composer_reasoning_efforts.insert(provider, effort);
-            } else {
-                self.composer_reasoning_efforts.remove(&provider);
-            }
-        }
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        self.composer_selections
+            .reconcile_catalog(catalog, &snapshot.agents, &snapshot.projects);
     }
 
     fn choose_composer_model(&mut self, provider: &str, model: &str, cx: &mut Context<Self>) {
-        if self
-            .provider_catalog_entry(provider)
-            .is_some_and(|entry| entry.models.iter().any(|candidate| candidate.id == model))
+        if let (Some(agent_id), Some(entry)) = (
+            self.selected_agent_id.as_deref(),
+            self.provider_catalog_entry(provider).cloned(),
+        ) && self
+            .composer_selections
+            .choose_model(agent_id, &entry, model)
         {
-            self.composer_models
-                .insert(provider.to_owned(), model.to_owned());
             self.reconcile_composer_catalog();
+            self.schedule_ui_state_save(cx);
             cx.notify();
         }
     }
 
     fn composer_prompt_options(&self, provider: &str) -> corbit_client::AgentPromptOptions {
-        let supports_turn_options = composer_supports_turn_options(provider);
+        let supports_turn_options = provider_supports_turn_options(provider);
         corbit_client::AgentPromptOptions {
             model: supports_turn_options
                 .then(|| {
@@ -931,28 +440,7 @@ impl ConnectionView {
                 ..
             } => {
                 let turn = self.timeline_turn_mut(agent_id, &turn_id);
-                turn.status = match status {
-                    corbit_client::AgentTurnStatus::Completed => TimelineStatus::Completed,
-                    corbit_client::AgentTurnStatus::Interrupted => TimelineStatus::Interrupted,
-                    corbit_client::AgentTurnStatus::Failed => TimelineStatus::Failed,
-                };
-                turn.error = error;
-                turn.completed_at = Some(occurred_at);
-                turn.duration_ms = duration_ms;
-                let terminal_step_status = if turn.status == TimelineStatus::Completed {
-                    corbit_client::AgentTimelineStepStatus::Completed
-                } else {
-                    corbit_client::AgentTimelineStepStatus::Failed
-                };
-                for step in &mut turn.steps {
-                    if matches!(
-                        step.status,
-                        corbit_client::AgentTimelineStepStatus::Pending
-                            | corbit_client::AgentTimelineStepStatus::InProgress
-                    ) {
-                        step.status = terminal_step_status;
-                    }
-                }
+                apply_turn_completed_event(turn, &status, error, occurred_at, duration_ms);
             }
             _ => unreachable!("only lifecycle events are routed here"),
         }
@@ -964,10 +452,24 @@ impl ConnectionView {
         event: corbit_client::AgentTimelineEvent,
     ) {
         match event {
-            corbit_client::AgentTimelineEvent::AssistantDelta { turn_id, delta, .. } => {
-                self.timeline_turn_mut(agent_id, &turn_id)
-                    .response
-                    .push_str(&delta);
+            corbit_client::AgentTimelineEvent::AssistantDelta {
+                turn_id,
+                item_id,
+                delta,
+                ..
+            } => {
+                let turn = self.timeline_turn_mut(agent_id, &turn_id);
+                let step = Self::timeline_step_mut(
+                    turn,
+                    item_id,
+                    TimelineStepKind::AssistantMessage {
+                        text: String::new(),
+                    },
+                );
+                step.status = corbit_client::AgentTimelineStepStatus::InProgress;
+                if let TimelineStepKind::AssistantMessage { text } = &mut step.kind {
+                    text.push_str(&delta);
+                }
             }
             corbit_client::AgentTimelineEvent::ReasoningDelta {
                 turn_id,
@@ -1254,7 +756,6 @@ impl ConnectionView {
             turn_id: turn_id.to_owned(),
             provider: None,
             prompt: String::new(),
-            response: String::new(),
             steps: Vec::new(),
             diff: None,
             usage: None,
@@ -1291,7 +792,7 @@ impl ConnectionView {
         self.timeline.clear();
         self.timeline_index.clear();
         self.timeline_dirty_turns.clear();
-        self.collapsed_timeline_steps.clear();
+        self.expanded_timeline_steps.clear();
         self.expanded_timeline_activity.clear();
         self.timeline_list_state.reset(0);
         self.timeline_list_agent_id = None;
@@ -1470,6 +971,10 @@ impl ConnectionView {
             self.show_validation_error("请等待 Daemon 连接完成", cx);
             return;
         }
+        if let Some(message) = self.provider_prompt_blocker(&provider) {
+            self.show_validation_error(message, cx);
+            return;
+        }
 
         let options = self.composer_prompt_options(&provider);
         let signature = serde_json::to_string(&(&agent_id, &text, &options))
@@ -1545,8 +1050,8 @@ impl ConnectionView {
             .timeline_index
             .location(agent_id, turn_id)
             .and_then(|location| self.timeline.get(location.timeline_index))
-            .map(|turn| turn.response.clone())
-            .filter(|response| !response.is_empty())
+            .and_then(final_response)
+            .map(str::to_owned)
         else {
             return;
         };
@@ -1689,8 +1194,8 @@ impl ConnectionView {
         key: &str,
         cx: &mut Context<Self>,
     ) {
-        if !self.collapsed_timeline_steps.remove(key) {
-            self.collapsed_timeline_steps.insert(key.to_owned());
+        if !self.expanded_timeline_steps.remove(key) {
+            self.expanded_timeline_steps.insert(key.to_owned());
         }
         self.timeline_dirty_turns
             .insert((agent_id.to_owned(), turn_id.to_owned()));
@@ -1754,8 +1259,29 @@ impl ConnectionView {
         cx: &mut Context<Self>,
     ) -> Div {
         let key = format!("{}:{}:{}", turn.agent_id, turn.turn_id, step.item_id);
-        let collapsed = self.collapsed_timeline_steps.contains(&key);
+        let expanded = self.expanded_timeline_steps.contains(&key);
+        if let TimelineStepKind::AssistantMessage { text } | TimelineStepKind::Reasoning { text } =
+            &step.kind
+        {
+            return div()
+                .w_full()
+                .py_2()
+                .text_size(font_px(CONVERSATION_BODY_FONT_SIZE))
+                .line_height(font_px(CONVERSATION_BODY_LINE_HEIGHT))
+                .text_color(rgb(COLOR_TEXT_SECONDARY))
+                .child(if text.trim().is_empty() {
+                    "正在分析…".to_owned()
+                } else {
+                    text.clone()
+                });
+        }
         let (icon, title, summary, copy_text) = match &step.kind {
+            TimelineStepKind::AssistantMessage { text } => (
+                AppIcon::Agent,
+                "过程说明".to_owned(),
+                text.lines().next().unwrap_or("正在处理…").to_owned(),
+                text.clone(),
+            ),
             TimelineStepKind::Reasoning { text } => (
                 AppIcon::Agent,
                 "思考过程".to_owned(),
@@ -1818,9 +1344,9 @@ impl ConnectionView {
                 error,
                 ..
             } => (
-                AppIcon::Provider,
-                title.clone().unwrap_or_else(|| "工具调用".to_owned()),
-                tool_name.clone(),
+                AppIcon::ToolCall,
+                tool_display_title(title.as_deref().unwrap_or(tool_name)),
+                String::new(),
                 [input.as_deref(), output.as_deref(), error.as_deref()]
                     .into_iter()
                     .flatten()
@@ -1838,6 +1364,10 @@ impl ConnectionView {
             corbit_client::AgentTimelineStepStatus::Declined => ("已拒绝", rgb(COLOR_WARNING)),
         };
         let detail = match &step.kind {
+            TimelineStepKind::AssistantMessage { text } => div()
+                .line_height(px(20.))
+                .text_color(rgb(COLOR_TEXT_SECONDARY))
+                .child(text.clone()),
             TimelineStepKind::Reasoning { text } => div()
                 .line_height(px(20.))
                 .text_color(rgb(COLOR_TEXT_SECONDARY))
@@ -2000,87 +1530,109 @@ impl ConnectionView {
         let toggle_turn_id = turn.turn_id.clone();
         let copy_disabled = copy_text.is_empty();
 
+        let has_detail = !copy_text.trim().is_empty();
+        let is_terminal_success = matches!(
+            step.status,
+            corbit_client::AgentTimelineStepStatus::Completed
+        );
+
         div()
             .v_flex()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(COLOR_BORDER_LIGHT))
-            .bg(rgb(COLOR_SURFACE_UNDER))
             .child(
                 div()
+                    .id(("toggle-timeline-step", control_id))
                     .h_flex()
+                    .w_full()
                     .items_center()
                     .gap_2()
-                    .min_h(px(42.))
-                    .px_3()
-                    .child(Icon::new(icon).size(px(15.)).text_color(status_color))
-                    .child(
-                        div()
-                            .v_flex()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(div().font_medium().child(title))
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(font_px(FONT_SIZE_XS))
-                                    .text_color(rgb(COLOR_TEXT_TERTIARY))
-                                    .child(summary),
-                            ),
-                    )
+                    .min_h(px(30.))
+                    .rounded_md()
+                    .px_1()
+                    .text_size(font_px(FONT_SIZE_BASE))
+                    .text_color(status_color)
+                    .when(has_detail, |row| {
+                        row.cursor_pointer()
+                            .hover(|row| row.bg(rgb(COLOR_SURFACE_UNDER)))
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(if expanded {
+                                    "收起调用详情"
+                                } else {
+                                    "展开调用详情"
+                                })
+                                .build(window, cx)
+                            })
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.toggle_timeline_step(
+                                    &toggle_agent_id,
+                                    &toggle_turn_id,
+                                    &toggle_key,
+                                    cx,
+                                );
+                            }))
+                    })
+                    .child(Icon::new(icon).size(px(16.)).text_color(status_color))
                     .child(
                         div()
                             .h_flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_size(font_px(FONT_SIZE_XS))
-                                    .text_color(status_color)
-                                    .child(status_label),
-                            )
-                            .child(
-                                Button::new(("copy-timeline-step", control_id))
-                                    .ghost()
-                                    .small()
-                                    .icon(Icon::new(AppIcon::Copy))
-                                    .tooltip("复制步骤内容")
-                                    .disabled(copy_disabled)
-                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                        view.copy_timeline_text(copy_text.clone(), "步骤内容", cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new(("toggle-timeline-step", control_id))
-                                    .ghost()
-                                    .small()
-                                    .icon(Icon::new(AppIcon::ChevronRight))
-                                    .tooltip(if collapsed {
-                                        "展开详情"
-                                    } else {
-                                        "收起详情"
-                                    })
-                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                        view.toggle_timeline_step(
-                                            &toggle_agent_id,
-                                            &toggle_turn_id,
-                                            &toggle_key,
-                                            cx,
-                                        );
-                                    })),
-                            ),
-                    ),
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap_2()
+                            .truncate()
+                            .child(title)
+                            .when(!summary.is_empty(), |label| {
+                                label.child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_color(rgb(COLOR_TEXT_TERTIARY))
+                                        .child(summary),
+                                )
+                            }),
+                    )
+                    .when(!is_terminal_success, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .text_size(font_px(FONT_SIZE_XS))
+                                .text_color(status_color)
+                                .child(status_label),
+                        )
+                    })
+                    .when(has_detail, |row| {
+                        row.child(
+                            Icon::new(AppIcon::ChevronRight)
+                                .size(px(13.))
+                                .text_color(rgb(COLOR_TEXT_TERTIARY))
+                                .when(expanded, |icon| icon.rotate(percentage(90. / 360.))),
+                        )
+                    }),
             )
-            .when(!collapsed, |card| {
-                card.child(
+            .when(expanded && has_detail, |row| {
+                row.child(
                     div()
                         .v_flex()
                         .gap_2()
-                        .border_t_1()
-                        .border_color(rgb(COLOR_BORDER_LIGHT))
-                        .px_3()
-                        .py_3()
-                        .child(detail),
+                        .ml(px(24.))
+                        .mt_1()
+                        .mb_2()
+                        .max_h(px(320.))
+                        .overflow_y_scrollbar()
+                        .pr_3()
+                        .text_size(font_px(FONT_SIZE_SM))
+                        .child(detail)
+                        .child(
+                            div().h_flex().justify_end().child(
+                                Button::new(("copy-timeline-step", control_id))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(AppIcon::Copy))
+                                    .tooltip("复制调用详情")
+                                    .disabled(copy_disabled)
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.copy_timeline_text(copy_text.clone(), "调用详情", cx);
+                                    })),
+                            ),
+                        ),
                 )
             })
     }
@@ -2115,247 +1667,133 @@ impl ConnectionView {
         u64::try_from(now.signed_duration_since(started_at).num_milliseconds()).ok()
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn render_active_timeline_step(step: &TimelineStep) -> Div {
-        let is_running = matches!(
-            step.status,
-            corbit_client::AgentTimelineStepStatus::Pending
-                | corbit_client::AgentTimelineStepStatus::InProgress
-        );
-        let (icon, summary, error) = match &step.kind {
-            TimelineStepKind::Reasoning { text } => {
-                let detail = text.lines().map(str::trim).find(|line| !line.is_empty());
-                let mut summary = if is_running {
-                    "正在分析任务".to_owned()
-                } else {
-                    "完成了任务分析".to_owned()
-                };
-                if let Some(detail) = detail {
-                    summary.push_str(" · ");
-                    summary.push_str(detail);
-                }
-                (AppIcon::Agent, summary, None)
-            }
-            TimelineStepKind::Plan { steps, .. } => (
-                AppIcon::Tasks,
-                if is_running {
-                    format!("正在更新执行计划 · {} 个步骤", steps.len())
-                } else {
-                    format!("更新了执行计划 · {} 个步骤", steps.len())
-                },
-                None,
+    fn timeline_usage_summary(usage: &TimelineUsage) -> String {
+        let mut parts = vec![
+            format!("{} tokens", Self::format_token_count(usage.total_tokens)),
+            format!(
+                "输入 {} · 输出 {}",
+                Self::format_token_count(usage.input_tokens),
+                Self::format_token_count(usage.output_tokens)
             ),
-            TimelineStepKind::Command {
-                command,
-                exit_code,
-                duration_ms,
-                ..
-            } => {
-                let mut summary = if is_running {
-                    "正在运行命令".to_owned()
-                } else {
-                    "运行了命令".to_owned()
-                };
-                if let Some(command) = command.lines().next().filter(|command| !command.is_empty())
-                {
-                    summary.push_str(" · ");
-                    summary.push_str(command);
-                }
-                if let Some(duration_ms) = duration_ms {
-                    summary.push_str(" · ");
-                    summary.push_str(&Self::format_duration(*duration_ms));
-                }
-                let error = exit_code
-                    .filter(|exit_code| *exit_code != 0)
-                    .map(|exit_code| format!("命令退出码 {exit_code}"));
-                (AppIcon::Terminal, summary, error)
-            }
-            TimelineStepKind::FileChange { changes } => {
-                let mut summary = if is_running {
-                    format!("正在修改文件 · {} 个文件", changes.len())
-                } else {
-                    format!("修改了 {} 个文件", changes.len())
-                };
-                if let Some(path) = changes.first().map(|change| change.path.as_str()) {
-                    summary.push_str(" · ");
-                    summary.push_str(path);
-                }
-                (AppIcon::Changes, summary, None)
-            }
-            TimelineStepKind::Diff { diff } => (
-                AppIcon::Changes,
-                if is_running {
-                    format!("正在整理更改 · {} 行", diff.lines().count())
-                } else {
-                    format!("整理了代码更改 · {} 行", diff.lines().count())
-                },
-                None,
-            ),
-            TimelineStepKind::Tool {
-                tool_name,
-                title,
-                error,
-                duration_ms,
-                ..
-            } => {
-                let tool_label = title.as_deref().unwrap_or(tool_name);
-                let mut summary = if is_running {
-                    format!("正在使用 {tool_label}")
-                } else {
-                    format!("使用了 {tool_label}")
-                };
-                if let Some(duration_ms) = duration_ms {
-                    summary.push_str(" · ");
-                    summary.push_str(&Self::format_duration(*duration_ms));
-                }
-                (AppIcon::Tool, summary, error.clone())
-            }
-        };
-        let failed = matches!(
-            step.status,
-            corbit_client::AgentTimelineStepStatus::Failed
-                | corbit_client::AgentTimelineStepStatus::Declined
-        ) || error.is_some();
-        let activity_color = if failed {
-            rgb(COLOR_ERROR)
-        } else {
-            rgb(COLOR_TEXT_SECONDARY)
-        };
-
-        div()
-            .v_flex()
-            .gap_1()
-            .py_1()
-            .child(
-                div()
-                    .h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .text_size(font_px(FONT_SIZE_BASE))
-                    .text_color(activity_color)
-                    .child(
-                        Icon::new(icon)
-                            .size(px(17.))
-                            .text_color(rgb(COLOR_TEXT_TERTIARY)),
-                    )
-                    .child(div().flex_1().min_w(px(0.)).truncate().child(summary)),
-            )
-            .when_some(error, |activity, error| {
-                activity.child(
-                    div()
-                        .pl(px(25.))
-                        .text_size(font_px(FONT_SIZE_SM))
-                        .text_color(rgb(COLOR_ERROR))
-                        .child(error),
-                )
-            })
+        ];
+        if let Some(cached) = usage.cached_input_tokens.filter(|tokens| *tokens > 0) {
+            parts.push(format!("缓存 {}", Self::format_token_count(cached)));
+        }
+        if let Some(reasoning) = usage.reasoning_output_tokens.filter(|tokens| *tokens > 0) {
+            parts.push(format!("推理 {}", Self::format_token_count(reasoning)));
+        }
+        if let Some(context_window) = usage.context_window.filter(|tokens| *tokens > 0) {
+            let percent = context_window_percent(usage.total_tokens, context_window);
+            parts.push(format!("上下文 {percent}%"));
+        }
+        parts.join(" · ")
     }
 
-    fn active_timeline_activity_summary(steps: &[TimelineStep], has_diff: bool) -> Option<String> {
-        let mut activities = Vec::new();
-        for step in steps {
-            let activity = match &step.kind {
-                TimelineStepKind::Reasoning { .. } => "分析任务",
-                TimelineStepKind::Plan { .. } => "更新计划",
-                TimelineStepKind::Command { .. } => "运行命令",
-                TimelineStepKind::FileChange { .. } => "修改文件",
-                TimelineStepKind::Diff { .. } => "整理更改",
-                TimelineStepKind::Tool { .. } => "调用工具",
-            };
-            if !activities.contains(&activity) {
-                activities.push(activity);
-            }
-        }
-        if has_diff && !activities.contains(&"整理更改") {
-            activities.push("整理更改");
-        }
-        (!activities.is_empty()).then(|| activities.join(" · "))
-    }
-
-    fn render_active_timeline_activity(
+    fn render_timeline_activity(
         &self,
         index: usize,
         turn: &TimelineTurn,
+        status: String,
+        status_color: gpui::Rgba,
         cx: &mut Context<Self>,
-    ) -> Option<Div> {
-        let has_diff = turn.diff.as_ref().is_some_and(|diff| !diff.is_empty());
-        let summary = Self::active_timeline_activity_summary(&turn.steps, has_diff)?;
+    ) -> Div {
         let key = format!("activity:{}:{}", turn.agent_id, turn.turn_id);
         let expanded = self.expanded_timeline_activity.contains(&key);
+        let final_response_index = final_response_step(turn).map(|(index, _)| index);
         let mut activity_rows = turn
             .steps
             .iter()
-            .map(Self::render_active_timeline_step)
+            .enumerate()
+            .filter(|(step_index, _)| Some(*step_index) != final_response_index)
+            .map(|(step_index, step)| self.render_timeline_step(index, step_index, turn, step, cx))
             .collect::<Vec<_>>();
         if let Some(diff) = turn.diff.as_ref().filter(|diff| !diff.is_empty()) {
-            activity_rows.push(Self::render_active_timeline_step(&TimelineStep {
+            let step = TimelineStep {
                 item_id: "turn-diff".into(),
-                status: corbit_client::AgentTimelineStepStatus::InProgress,
+                status: match turn.status {
+                    TimelineStatus::InProgress => {
+                        corbit_client::AgentTimelineStepStatus::InProgress
+                    }
+                    TimelineStatus::Completed => corbit_client::AgentTimelineStepStatus::Completed,
+                    TimelineStatus::Interrupted => corbit_client::AgentTimelineStepStatus::Declined,
+                    TimelineStatus::Failed => corbit_client::AgentTimelineStepStatus::Failed,
+                },
                 kind: TimelineStepKind::Diff { diff: diff.clone() },
-            }));
+            };
+            activity_rows.push(self.render_timeline_step(index, turn.steps.len(), turn, &step, cx));
+        }
+        if turn.status == TimelineStatus::InProgress {
+            activity_rows.push(Self::render_thinking_shimmer(&turn.turn_id));
+        }
+        let has_activity = !activity_rows.is_empty();
+        let mut activity_tooltip = if expanded {
+            "收起思考与调用".to_owned()
+        } else {
+            "展开思考与调用".to_owned()
+        };
+        if let Some(usage) = &turn.usage {
+            activity_tooltip.push('\n');
+            activity_tooltip.push_str(&Self::timeline_usage_summary(usage));
         }
         let toggle_key = key.clone();
         let toggle_agent_id = turn.agent_id.clone();
         let toggle_turn_id = turn.turn_id.clone();
 
-        Some(
-            div()
-                .v_flex()
-                .gap_1()
-                .child(
-                    div()
-                        .id(("toggle-active-timeline-activity", index))
-                        .h_flex()
-                        .w_full()
-                        .min_h(px(32.))
-                        .items_center()
-                        .gap_2()
-                        .rounded_md()
-                        .px_1()
-                        .cursor_pointer()
-                        .text_size(font_px(FONT_SIZE_BASE))
-                        .text_color(rgb(COLOR_TEXT_SECONDARY))
-                        .hover(|row| row.bg(rgb(COLOR_SURFACE_UNDER)))
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(if expanded {
-                                "收起思考活动"
-                            } else {
-                                "展开思考活动"
+        div()
+            .v_flex()
+            .child(
+                div()
+                    .id(("toggle-timeline-activity", index))
+                    .h_flex()
+                    .w_full()
+                    .min_h(px(32.))
+                    .items_center()
+                    .gap_1()
+                    .rounded_md()
+                    .px_1()
+                    .text_size(font_px(FONT_SIZE_BASE))
+                    .font_medium()
+                    .text_color(status_color)
+                    .when(has_activity, |row| {
+                        row.cursor_pointer()
+                            .hover(|row| row.bg(rgb(COLOR_SURFACE_UNDER)))
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(activity_tooltip.clone()).build(window, cx)
                             })
-                            .build(window, cx)
-                        })
-                        .child(
-                            Icon::new(AppIcon::Tool)
-                                .size(px(17.))
-                                .text_color(rgb(COLOR_TEXT_TERTIARY)),
-                        )
-                        .child(div().flex_1().min_w(px(0.)).truncate().child(summary))
-                        .child(
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.toggle_timeline_activity(
+                                    &toggle_agent_id,
+                                    &toggle_turn_id,
+                                    &toggle_key,
+                                    cx,
+                                );
+                            }))
+                    })
+                    .child(status)
+                    .when(has_activity, |row| {
+                        row.child(
                             Icon::new(AppIcon::ChevronRight)
-                                .size(px(14.))
-                                .text_color(rgb(COLOR_TEXT_TERTIARY))
+                                .size(px(13.))
+                                .text_color(status_color)
                                 .when(expanded, |icon| icon.rotate(percentage(90. / 360.))),
                         )
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.toggle_timeline_activity(
-                                &toggle_agent_id,
-                                &toggle_turn_id,
-                                &toggle_key,
-                                cx,
-                            );
-                        })),
+                    }),
+            )
+            .child(div().w_full().h(px(1.)).bg(rgb(COLOR_BORDER_LIGHT)))
+            .when(expanded && has_activity, |activity| {
+                activity.child(
+                    div()
+                        .id(("timeline-activity-details", index))
+                        .v_flex()
+                        .gap_1()
+                        .max_h(px(440.))
+                        .overflow_y_scrollbar()
+                        .pt_3()
+                        .pb_2()
+                        .pr_3()
+                        .children(activity_rows),
                 )
-                .when(expanded, |activity| {
-                    activity.child(
-                        div()
-                            .id(("active-timeline-activity-details", index))
-                            .max_h(px(320.))
-                            .overflow_y_scrollbar()
-                            .child(div().v_flex().gap_1().pr_3().children(activity_rows)),
-                    )
-                }),
-        )
+            })
     }
 
     fn thinking_shimmer_opacity(delta: f32, glyph_index: u8) -> f32 {
@@ -2558,84 +1996,17 @@ impl ConnectionView {
             turn.prompt.clone()
         };
         let prompt_to_copy = turn.prompt.clone();
-        let response_is_empty = turn.response.is_empty();
+        let response_text = final_response(turn).unwrap_or_default();
+        let response_is_empty = response_text.is_empty();
         let response_agent_id = turn.agent_id.clone();
         let response_turn_id = turn.turn_id.clone();
         let retry_prompt = turn.prompt.clone();
         let prompt_group: SharedString = format!("timeline-prompt-{index}").into();
-        let response_group: SharedString = format!("timeline-response-{index}").into();
         let is_in_progress = turn.status == TimelineStatus::InProgress;
-        let active_activity = is_in_progress
-            .then(|| self.render_active_timeline_activity(index, turn, cx))
-            .flatten();
-        let execution_steps = if is_in_progress {
-            Vec::new()
-        } else {
-            turn.steps
-                .iter()
-                .enumerate()
-                .map(|(step_index, step)| {
-                    self.render_timeline_step(index, step_index, turn, step, cx)
-                })
-                .collect::<Vec<_>>()
-        };
-        let diff_card = if is_in_progress {
+        let activity = self.render_timeline_activity(index, turn, status, status_color, cx);
+        let response = if response_text.is_empty() && is_in_progress {
             None
-        } else {
-            turn.diff
-                .as_ref()
-                .filter(|diff| !diff.is_empty())
-                .map(|diff| {
-                    let step = TimelineStep {
-                        item_id: "turn-diff".into(),
-                        status: match turn.status {
-                            TimelineStatus::InProgress => {
-                                corbit_client::AgentTimelineStepStatus::InProgress
-                            }
-                            TimelineStatus::Completed => {
-                                corbit_client::AgentTimelineStepStatus::Completed
-                            }
-                            TimelineStatus::Interrupted => {
-                                corbit_client::AgentTimelineStepStatus::Declined
-                            }
-                            TimelineStatus::Failed => {
-                                corbit_client::AgentTimelineStepStatus::Failed
-                            }
-                        },
-                        kind: TimelineStepKind::Diff { diff: diff.clone() },
-                    };
-                    self.render_timeline_step(index, turn.steps.len(), turn, &step, cx)
-                })
-        };
-        let metrics = {
-            let mut parts = Vec::new();
-            if let Some(usage) = &turn.usage {
-                parts.push(format!(
-                    "{} tokens",
-                    Self::format_token_count(usage.total_tokens)
-                ));
-                parts.push(format!(
-                    "输入 {} · 输出 {}",
-                    Self::format_token_count(usage.input_tokens),
-                    Self::format_token_count(usage.output_tokens)
-                ));
-                if let Some(cached) = usage.cached_input_tokens.filter(|tokens| *tokens > 0) {
-                    parts.push(format!("缓存 {}", Self::format_token_count(cached)));
-                }
-                if let Some(reasoning) = usage.reasoning_output_tokens.filter(|tokens| *tokens > 0)
-                {
-                    parts.push(format!("推理 {}", Self::format_token_count(reasoning)));
-                }
-                if let Some(context_window) = usage.context_window.filter(|tokens| *tokens > 0) {
-                    let percent = context_window_percent(usage.total_tokens, context_window);
-                    parts.push(format!("上下文 {percent}%"));
-                }
-            }
-            (!parts.is_empty()).then(|| parts.join(" · "))
-        };
-        let response = if turn.response.is_empty() && is_in_progress {
-            None
-        } else if turn.response.is_empty() {
+        } else if response_text.is_empty() {
             Some(
                 div()
                     .text_size(font_px(CONVERSATION_BODY_FONT_SIZE))
@@ -2645,7 +2016,7 @@ impl ConnectionView {
                     .into_any_element(),
             )
         } else if is_in_progress {
-            let (preview, is_truncated) = streaming_response_preview(&turn.response);
+            let (preview, is_truncated) = streaming_response_preview(response_text);
             Some(
                 div()
                     .v_flex()
@@ -2671,7 +2042,7 @@ impl ConnectionView {
         } else {
             let response = TextView::markdown(
                 SharedString::from(format!("timeline-response-{}", turn.turn_id)),
-                turn.response.clone(),
+                response_text.to_owned(),
                 window,
                 cx,
             )
@@ -2680,7 +2051,7 @@ impl ConnectionView {
             .w_full()
             .text_size(font_px(CONVERSATION_BODY_FONT_SIZE))
             .line_height(font_px(CONVERSATION_BODY_LINE_HEIGHT));
-            let response = if should_virtualize_response(&turn.response) {
+            let response = if should_virtualize_response(response_text) {
                 response.scrollable(true).h(px(LONG_RESPONSE_VIEW_HEIGHT))
             } else {
                 response
@@ -2732,71 +2103,31 @@ impl ConnectionView {
             .child(
                 div()
                     .relative()
-                    .group(response_group.clone())
                     .v_flex()
                     .gap_4()
-                    .child(
-                        div()
-                            .v_flex()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .h_flex()
-                                    .min_h(px(24.))
-                                    .items_center()
-                                    .justify_between()
-                                    .text_size(font_px(FONT_SIZE_SM))
-                                    .text_color(status_color)
-                                    .child(
-                                        div()
-                                            .h_flex()
-                                            .items_center()
-                                            .gap_2()
-                    .child(provider_logo(provider_id, 18.))
-                                            .child(status),
-                                    )
-                                    .child(
-                                        div()
-                                            .invisible()
-                                            .group_hover(response_group, gpui::Styled::visible)
-                                            .child(
-                                                Button::new(("copy-turn-response", index))
-                                                    .ghost()
-                                                    .xsmall()
-                                                    .icon(Icon::new(AppIcon::Copy))
-                                                    .tooltip("复制回答")
-                                                    .disabled(response_is_empty)
-                                                    .on_click(cx.listener(
-                                                        move |view, _, _, cx| {
-                                                            view.copy_timeline_response(
-                                                                &response_agent_id,
-                                                                &response_turn_id,
-                                                                cx,
-                                                            );
-                                                        },
-                                                    )),
-                                            ),
-                                    ),
-                            )
-                            .child(div().w_full().h(px(1.)).bg(rgb(COLOR_BORDER_LIGHT))),
-                    )
-                    .when_some(active_activity, gpui::ParentElement::child)
-                    .children(execution_steps)
-                    .when_some(diff_card, gpui::ParentElement::child)
+                    .child(activity)
                     .when_some(response, gpui::ParentElement::child)
-                    .when(is_in_progress, |conversation| {
-                        conversation.child(Self::render_thinking_shimmer(&turn.turn_id))
-                    })
-                    .when_some(metrics, |conversation, metrics| {
+                    .when(!response_is_empty, |conversation| {
                         conversation.child(
                             div()
                                 .h_flex()
                                 .items_center()
-                                .gap_1()
-                                .text_size(font_px(FONT_SIZE_XS))
+                                .min_h(px(24.))
                                 .text_color(rgb(COLOR_TEXT_TERTIARY))
-                .child(provider_logo(provider_id, 16.))
-                                .child(metrics),
+                                .child(
+                                    Button::new(("copy-turn-response", index))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(Icon::new(AppIcon::Copy))
+                                        .tooltip("复制回答")
+                                        .on_click(cx.listener(move |view, _, _, cx| {
+                                            view.copy_timeline_response(
+                                                &response_agent_id,
+                                                &response_turn_id,
+                                                cx,
+                                            );
+                                        })),
+                                ),
                         )
                     }),
             )
@@ -3360,6 +2691,9 @@ impl ConnectionView {
         let provider_id = selected_agent
             .map(|agent| agent.provider.clone())
             .unwrap_or_default();
+        let provider_prompt_blocker = (!provider_id.is_empty())
+            .then(|| self.provider_prompt_blocker(&provider_id))
+            .flatten();
         let active_turn = selected_agent_id.as_deref().and_then(|agent_id| {
             self.timeline_index
                 .agent_indices(agent_id)
@@ -3374,6 +2708,7 @@ impl ConnectionView {
             && !self.prompt_in_flight
             && !self.attachment_in_flight
             && !self.provider_switch_in_flight
+            && provider_prompt_blocker.is_none()
             && active_turn.is_none();
         let turn_count = selected_agent_id.as_deref().map_or(0, |agent_id| {
             self.timeline_index.agent_indices(agent_id).len()
@@ -3390,15 +2725,17 @@ impl ConnectionView {
             "选择项目并描述目标后，Corbit 会自动创建 Agent 并进入对话。"
         };
         let prompt_hint = if !selected_agent_exists {
-            "请先使用“新建任务”开始任务"
+            "请先使用“新建任务”开始任务".to_owned()
         } else if !is_online {
-            "Daemon 当前未连接"
+            "Daemon 当前未连接".to_owned()
         } else if !selected_agent_running {
-            "请先在工作区管理中启动 Agent"
+            "请先在工作区管理中启动 Agent".to_owned()
         } else if active_turn.is_some() {
-            "Agent 正在处理当前任务"
+            "Agent 正在处理当前任务".to_owned()
+        } else if let Some(message) = &provider_prompt_blocker {
+            message.clone()
         } else {
-            "发送内容将创建一个新的 Turn"
+            "发送内容将创建一个新的 Turn".to_owned()
         };
         let action_variant = composer_action_variant(cx);
         let composer_action = if let Some((agent_id, turn_id)) = active_turn.clone() {
@@ -3426,7 +2763,7 @@ impl ConnectionView {
                     view.send_prompt(cx);
                 }))
         };
-        let supports_turn_options = composer_supports_turn_options(&provider_id);
+        let supports_turn_options = provider_supports_turn_options(&provider_id);
         let provider_choices = self.provider_options();
         let provider_view = cx.entity();
         let selected_provider = provider_id.clone();
@@ -3435,7 +2772,7 @@ impl ConnectionView {
             .custom(option_variant)
             .xsmall()
             .rounded(px(10.))
-                    .child(provider_logo(&provider_id, 16.))
+            .child(provider_badge(&provider_id, ProviderBadgeSize::Inline))
             .child(Self::provider_label(&provider_id).to_owned())
             .dropdown_caret(true)
             .tooltip("切换当前项目的模型提供商")
@@ -3482,7 +2819,13 @@ impl ConnectionView {
             });
         let selected_model = self.composer_model_info(&provider_id).cloned();
         let model_label = selected_model.as_ref().map_or_else(
-            || "Provider 默认".to_owned(),
+            || {
+                if provider_prompt_blocker.is_some() {
+                    "Provider 不可用".to_owned()
+                } else {
+                    "Provider 默认".to_owned()
+                }
+            },
             |model| model.display_name.clone(),
         );
         let model_choices = self
@@ -3650,8 +2993,15 @@ impl ConnectionView {
                         .checked(reasoning_effort == Some(effort))
                         .on_click(move |_, _, cx| {
                             item_view.update(cx, |view, cx| {
-                                view.composer_reasoning_efforts
-                                    .insert(item_provider.clone(), effort);
+                                if let (Some(agent_id), Some(entry)) = (
+                                    view.selected_agent_id.as_deref(),
+                                    view.provider_catalog_entry(&item_provider).cloned(),
+                                ) && view
+                                    .composer_selections
+                                    .choose_reasoning_effort(agent_id, &entry, effort)
+                                {
+                                    view.schedule_ui_state_save(cx);
+                                }
                                 cx.notify();
                             });
                         }),
@@ -3905,7 +3255,9 @@ impl ConnectionView {
                                             .truncate()
                                             .text_size(font_px(FONT_SIZE_XS))
                                             .text_color(rgb(COLOR_TEXT_TERTIARY))
-                                            .when(!can_prompt, |status| status.child(prompt_hint)),
+                                            .when(!can_prompt, move |status| {
+                                                status.child(prompt_hint)
+                                            }),
                                     )
                                     .child(
                                         div()
@@ -3948,6 +3300,16 @@ mod tests {
     }
 
     #[test]
+    fn internal_tool_names_use_codex_style_labels() {
+        assert_eq!(
+            tool_display_title("search_openai_docs"),
+            "Search OpenAI docs"
+        );
+        assert_eq!(tool_display_title("fetch_openai_doc"), "Fetch OpenAI doc");
+        assert_eq!(tool_display_title("Web search"), "Web search");
+    }
+
+    #[test]
     fn only_long_completed_responses_use_block_virtualization() {
         assert!(!should_virtualize_response(
             &"x".repeat(LONG_RESPONSE_VIRTUALIZATION_BYTES - 1)
@@ -3955,6 +3317,56 @@ mod tests {
         assert!(should_virtualize_response(
             &"x".repeat(LONG_RESPONSE_VIRTUALIZATION_BYTES)
         ));
+    }
+
+    #[test]
+    fn only_the_last_assistant_item_after_tool_activity_is_the_final_answer() {
+        let mut turn = TimelineTurn {
+            agent_id: "agent-1".into(),
+            turn_id: "turn-1".into(),
+            provider: Some("codex".into()),
+            prompt: "问题".into(),
+            steps: vec![
+                TimelineStep {
+                    item_id: "message-commentary".into(),
+                    status: corbit_client::AgentTimelineStepStatus::Completed,
+                    kind: TimelineStepKind::AssistantMessage {
+                        text: "我先检查当前实现。".into(),
+                    },
+                },
+                TimelineStep {
+                    item_id: "tool-1".into(),
+                    status: corbit_client::AgentTimelineStepStatus::Completed,
+                    kind: TimelineStepKind::Tool {
+                        tool_name: "search".into(),
+                        title: Some("Search docs".into()),
+                        input: None,
+                        output: None,
+                        error: None,
+                        duration_ms: None,
+                    },
+                },
+                TimelineStep {
+                    item_id: "message-final".into(),
+                    status: corbit_client::AgentTimelineStepStatus::Completed,
+                    kind: TimelineStepKind::AssistantMessage {
+                        text: "这是最终回答。".into(),
+                    },
+                },
+            ],
+            diff: None,
+            usage: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            status: TimelineStatus::Completed,
+            error: None,
+        };
+
+        assert_eq!(final_response_step(&turn), Some((2, "这是最终回答。")));
+
+        turn.steps.pop();
+        assert_eq!(final_response(&turn), None);
     }
 
     #[test]
@@ -3969,21 +3381,21 @@ mod tests {
     fn permission_modes_use_codex_copy() {
         assert_eq!(
             permission_mode_copy(corbit_client::AgentPermissionMode::ReadOnly),
-            PermissionModeCopy {
+            composer::PermissionModeCopy {
                 title: "请求批准",
                 description: "编辑外部文件和使用互联网时始终询问",
             }
         );
         assert_eq!(
             permission_mode_copy(corbit_client::AgentPermissionMode::WorkspaceWrite),
-            PermissionModeCopy {
+            composer::PermissionModeCopy {
                 title: "帮我批准",
                 description: "仅对检测到的风险操作请求批准",
             }
         );
         assert_eq!(
             permission_mode_copy(corbit_client::AgentPermissionMode::FullAccess),
-            PermissionModeCopy {
+            composer::PermissionModeCopy {
                 title: "完全访问权限",
                 description: "可不受限制地访问互联网和你电脑上的任何文件",
             }
@@ -3997,7 +3409,6 @@ mod tests {
             turn_id: "turn-1".into(),
             provider: None,
             prompt: String::new(),
-            response: String::new(),
             steps: Vec::new(),
             diff: None,
             usage: None,
@@ -4018,7 +3429,13 @@ mod tests {
         assert!(!is_permission_placeholder(&turn));
 
         turn.started_at = None;
-        turn.response = "已开始处理".into();
+        turn.steps.push(TimelineStep {
+            item_id: "message-1".into(),
+            status: corbit_client::AgentTimelineStepStatus::InProgress,
+            kind: TimelineStepKind::AssistantMessage {
+                text: "已开始处理".into(),
+            },
+        });
         assert!(!is_permission_placeholder(&turn));
     }
 
@@ -4029,8 +3446,13 @@ mod tests {
             turn_id: "turn-1".into(),
             provider: Some("codex".into()),
             prompt: "原始问题".into(),
-            response: "已完成回答".into(),
-            steps: Vec::new(),
+            steps: vec![TimelineStep {
+                item_id: "message-1".into(),
+                status: corbit_client::AgentTimelineStepStatus::Completed,
+                kind: TimelineStepKind::AssistantMessage {
+                    text: "已完成回答".into(),
+                },
+            }],
             diff: None,
             usage: None,
             started_at: Some("2026-08-17T00:00:00Z".into()),
@@ -4047,6 +3469,87 @@ mod tests {
         assert_eq!(turn.started_at.as_deref(), Some("2026-08-17T00:00:00Z"));
         assert_eq!(turn.completed_at.as_deref(), Some("2026-08-17T00:00:01Z"));
         assert_eq!(turn.duration_ms, Some(1_000));
+    }
+
+    #[test]
+    fn lifecycle_replay_keeps_terminal_state_after_late_start_event() {
+        let mut turn = TimelineTurn {
+            agent_id: "agent-1".into(),
+            turn_id: "turn-1".into(),
+            provider: Some("claude".into()),
+            prompt: "问题".into(),
+            steps: vec![TimelineStep {
+                item_id: "message-1".into(),
+                status: corbit_client::AgentTimelineStepStatus::InProgress,
+                kind: TimelineStepKind::AssistantMessage {
+                    text: "回答".into(),
+                },
+            }],
+            diff: None,
+            usage: None,
+            started_at: Some("2026-08-17T00:00:00Z".into()),
+            completed_at: None,
+            duration_ms: None,
+            status: TimelineStatus::InProgress,
+            error: None,
+        };
+
+        apply_turn_completed_event(
+            &mut turn,
+            &corbit_client::AgentTurnStatus::Completed,
+            None,
+            "2026-08-17T00:00:08Z".into(),
+            Some(8_000),
+        );
+        apply_turn_started_event(
+            &mut turn,
+            "重放的空 prompt".into(),
+            "2026-08-17T00:00:09Z".into(),
+        );
+
+        assert_eq!(turn.status, TimelineStatus::Completed);
+        assert_eq!(turn.prompt, "问题");
+        assert_eq!(turn.completed_at.as_deref(), Some("2026-08-17T00:00:08Z"));
+        assert_eq!(turn.duration_ms, Some(8_000));
+    }
+
+    #[test]
+    fn lifecycle_completion_preserves_failure_semantics_and_closes_steps() {
+        let mut turn = TimelineTurn {
+            agent_id: "agent-1".into(),
+            turn_id: "turn-1".into(),
+            provider: Some("codex".into()),
+            prompt: "问题".into(),
+            steps: vec![TimelineStep {
+                item_id: "step-1".into(),
+                status: corbit_client::AgentTimelineStepStatus::InProgress,
+                kind: TimelineStepKind::Reasoning {
+                    text: "处理中".into(),
+                },
+            }],
+            diff: None,
+            usage: None,
+            started_at: Some("2026-08-17T00:00:00Z".into()),
+            completed_at: None,
+            duration_ms: None,
+            status: TimelineStatus::InProgress,
+            error: None,
+        };
+
+        apply_turn_completed_event(
+            &mut turn,
+            &corbit_client::AgentTurnStatus::Failed,
+            Some("连接中断".into()),
+            "2026-08-17T00:00:02Z".into(),
+            Some(2_000),
+        );
+
+        assert_eq!(turn.status, TimelineStatus::Failed);
+        assert_eq!(turn.error.as_deref(), Some("连接中断"));
+        assert_eq!(
+            turn.steps[0].status,
+            corbit_client::AgentTimelineStepStatus::Failed
+        );
     }
 
     #[test]
@@ -4112,7 +3615,7 @@ mod tests {
     fn conversation_index_samples_long_histories_and_keeps_both_ends() {
         let entries = conversation_index_entries(1_000);
 
-        assert_eq!(entries.len(), CONVERSATION_INDEX_MAX_MARKERS);
+        assert_eq!(entries.len(), index::CONVERSATION_INDEX_MAX_MARKERS);
         assert_eq!(entries.first(), Some(&0));
         assert_eq!(entries.last(), Some(&999));
         assert!(entries.windows(2).all(|pair| pair[0] < pair[1]));
@@ -4220,59 +3723,19 @@ mod tests {
     }
 
     #[test]
-    fn active_activity_summary_is_compact_and_deduplicated() {
-        let completed = corbit_client::AgentTimelineStepStatus::Completed;
-        let steps = vec![
-            TimelineStep {
-                item_id: "reasoning".into(),
-                status: completed,
-                kind: TimelineStepKind::Reasoning {
-                    text: "分析结构".into(),
-                },
-            },
-            TimelineStep {
-                item_id: "tool".into(),
-                status: completed,
-                kind: TimelineStepKind::Tool {
-                    tool_name: "read_file".into(),
-                    title: Some("读取文件".into()),
-                    input: None,
-                    output: None,
-                    error: None,
-                    duration_ms: None,
-                },
-            },
-            TimelineStep {
-                item_id: "command-1".into(),
-                status: completed,
-                kind: TimelineStepKind::Command {
-                    command: "rg timeline".into(),
-                    cwd: None,
-                    output: String::new(),
-                    exit_code: Some(0),
-                    duration_ms: None,
-                },
-            },
-            TimelineStep {
-                item_id: "command-2".into(),
-                status: completed,
-                kind: TimelineStepKind::Command {
-                    command: "cargo check".into(),
-                    cwd: None,
-                    output: String::new(),
-                    exit_code: Some(0),
-                    duration_ms: None,
-                },
-            },
-        ];
+    fn activity_usage_stays_available_without_cluttering_the_answer() {
+        let usage = TimelineUsage {
+            input_tokens: 1_200,
+            output_tokens: 345,
+            total_tokens: 1_545,
+            cached_input_tokens: Some(800),
+            reasoning_output_tokens: Some(120),
+            context_window: Some(10_000),
+        };
 
         assert_eq!(
-            ConnectionView::active_timeline_activity_summary(&steps, true).as_deref(),
-            Some("分析任务 · 调用工具 · 运行命令 · 整理更改")
-        );
-        assert_eq!(
-            ConnectionView::active_timeline_activity_summary(&[], false),
-            None
+            ConnectionView::timeline_usage_summary(&usage),
+            "1.5k tokens · 输入 1.2k · 输出 345 · 缓存 800 · 推理 120 · 上下文 15%"
         );
     }
 

@@ -1,9 +1,15 @@
 mod appearance;
 mod branding;
+mod build_info;
 mod connection;
 mod discovery;
 mod event_batch;
 mod feedback;
+mod local_daemon;
+mod plugins;
+mod provider;
+mod provider_catalog;
+mod provider_selection;
 mod resources;
 mod settings;
 #[cfg(target_os = "macos")]
@@ -18,10 +24,15 @@ use appearance::{
     AppearancePreferences, CodeFont, CodeTextSize, ColorScheme, ContentWidth, ContrastLevel,
     InterfaceFont, InterfaceTextSize,
 };
-use branding::{AppIcon, BrandAssets, brand_mark, provider_logo};
+use branding::{AppIcon, BrandAssets, brand_mark};
 use connection::{ConnectionPreferences, CredentialSource};
 use discovery::{ActivityFilter, SearchScope};
 use feedback::{FeedbackKind, push_app_notification};
+use provider::{
+    PROVIDERS, ProviderBadgeSize, ProviderInfo, provider_badge, provider_label,
+    provider_supports_turn_options, reasoning_effort_label, reasoning_effort_short_label,
+};
+use provider_selection::ComposerSelections;
 use resources::{DeleteTarget, RetryMutation};
 use tasks::{PendingNewTaskRecovery, TaskFilter};
 use theme::{
@@ -104,6 +115,7 @@ enum ResourceSection {
     General,
     Appearance,
     Providers,
+    Plugins,
     Shortcuts,
     Projects,
     Workspaces,
@@ -116,6 +128,8 @@ enum ResourceSection {
 struct ConnectionView {
     state: corbit_client::ConnectionState,
     detail: String,
+    connection_generation: u64,
+    local_daemon_status: local_daemon::DaemonStatus,
     feedback: Option<feedback::AppFeedback>,
     feedback_generation: u64,
     daemon_endpoint: String,
@@ -128,6 +142,15 @@ struct ConnectionView {
     connection_settings_error: Option<String>,
     server_info: Option<corbit_client::ServerInfo>,
     provider_catalog: Option<corbit_client::ProviderCatalog>,
+    provider_catalog_error: Option<String>,
+    provider_catalog_request_id: u64,
+    plugins: Vec<corbit_client::PluginRecord>,
+    plugin_marketplace: Vec<corbit_client::PluginMarketplaceEntry>,
+    plugin_audit: Vec<corbit_client::PluginAuditEntry>,
+    pending_plugin_uninstall: Option<String>,
+    pending_plugin_update: Option<String>,
+    pending_plugin_write: Option<String>,
+    pending_plugin_inspection: Option<corbit_client::PluginInspection>,
     main_section: MainSection,
     sidebar_collapsed: bool,
     settings_return_section: MainSection,
@@ -164,9 +187,8 @@ struct ConnectionView {
     prompt_drafts: BTreeMap<String, String>,
     prompt_input_agent_id: Option<String>,
     prompt_clear_agent_id: Option<String>,
-    composer_models: BTreeMap<String, String>,
+    composer_selections: ComposerSelections,
     composer_permission_mode: corbit_client::AgentPermissionMode,
-    composer_reasoning_efforts: BTreeMap<String, corbit_client::AgentReasoningEffort>,
     prompt_attachments: Vec<ComposerAttachment>,
     attachment_in_flight: bool,
     new_task_clear_requested: bool,
@@ -186,7 +208,7 @@ struct ConnectionView {
     timeline: Vec<TimelineTurn>,
     timeline_index: TimelineIndex,
     timeline_dirty_turns: BTreeSet<(String, String)>,
-    collapsed_timeline_steps: BTreeSet<String>,
+    expanded_timeline_steps: BTreeSet<String>,
     expanded_timeline_activity: BTreeSet<String>,
     permissions: Vec<PendingPermission>,
     workspace_listing: Option<corbit_client::WorkspaceDirectoryListing>,
@@ -200,6 +222,7 @@ struct ConnectionView {
     prompt_in_flight: bool,
     control_in_flight: bool,
     provider_switch_in_flight: bool,
+    plugin_operation_in_flight: bool,
     file_operation_state: FileOperationState,
     file_operation_target: Option<FileOperationTarget>,
     git_operation_state: GitOperationState,
@@ -208,12 +231,16 @@ struct ConnectionView {
     retry_control: Option<RetryControl>,
     delete_confirmation: Option<DeleteTarget>,
     runtime: Option<corbit_client::DaemonRuntime>,
+    daemon_preflight_task: Option<Task<()>>,
+    daemon_action_task: Option<Task<()>>,
     event_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
     prompt_task: Option<Task<()>>,
     control_task: Option<Task<()>>,
     provider_catalog_task: Option<Task<()>>,
+    provider_catalog_refresh_task: Option<Task<()>>,
     provider_switch_task: Option<Task<()>>,
+    plugin_task: Option<Task<()>>,
     file_task: Option<Task<()>>,
     git_task: Option<Task<()>>,
     new_task_task: Option<Task<()>>,
@@ -241,6 +268,7 @@ impl ConnectionView {
             selected_agent_id,
             selected_provider,
             project_providers,
+            composer_selections,
             task_filter,
             new_task_draft,
             prompt_drafts,
@@ -436,6 +464,8 @@ impl ConnectionView {
         let view = Self {
             state: corbit_client::ConnectionState::Offline,
             detail: "等待连接本机 Corbit Daemon".into(),
+            connection_generation: 0,
+            local_daemon_status: local_daemon::DaemonStatus::checking(),
             feedback: None,
             feedback_generation: 0,
             daemon_endpoint: daemon_endpoint.clone(),
@@ -448,6 +478,15 @@ impl ConnectionView {
             connection_settings_error: None,
             server_info: None,
             provider_catalog: None,
+            provider_catalog_error: None,
+            provider_catalog_request_id: 0,
+            plugins: Vec::new(),
+            plugin_marketplace: Vec::new(),
+            plugin_audit: Vec::new(),
+            pending_plugin_uninstall: None,
+            pending_plugin_update: None,
+            pending_plugin_write: None,
+            pending_plugin_inspection: None,
             main_section,
             sidebar_collapsed,
             settings_return_section,
@@ -484,9 +523,8 @@ impl ConnectionView {
             prompt_drafts,
             prompt_input_agent_id,
             prompt_clear_agent_id: None,
-            composer_models: BTreeMap::new(),
+            composer_selections,
             composer_permission_mode: corbit_client::AgentPermissionMode::WorkspaceWrite,
-            composer_reasoning_efforts: BTreeMap::new(),
             prompt_attachments: Vec::new(),
             attachment_in_flight: false,
             new_task_clear_requested: false,
@@ -514,7 +552,7 @@ impl ConnectionView {
             timeline: Vec::new(),
             timeline_index: TimelineIndex::default(),
             timeline_dirty_turns: BTreeSet::new(),
-            collapsed_timeline_steps: BTreeSet::new(),
+            expanded_timeline_steps: BTreeSet::new(),
             expanded_timeline_activity: BTreeSet::new(),
             permissions: Vec::new(),
             workspace_listing: None,
@@ -528,6 +566,7 @@ impl ConnectionView {
             prompt_in_flight: false,
             control_in_flight: false,
             provider_switch_in_flight: false,
+            plugin_operation_in_flight: false,
             file_operation_state: FileOperationState::Idle,
             file_operation_target: None,
             git_operation_state: GitOperationState::Idle,
@@ -536,12 +575,16 @@ impl ConnectionView {
             retry_control: None,
             delete_confirmation: None,
             runtime: None,
+            daemon_preflight_task: None,
+            daemon_action_task: None,
             event_task: None,
             mutation_task: None,
             prompt_task: None,
             control_task: None,
             provider_catalog_task: None,
+            provider_catalog_refresh_task: None,
             provider_switch_task: None,
+            plugin_task: None,
             file_task: None,
             git_task: None,
             new_task_task: None,
@@ -555,11 +598,18 @@ impl ConnectionView {
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
+        if self.daemon_preflight_task.is_some() {
+            return;
+        }
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        let generation = self.connection_generation;
+        self.daemon_preflight_task = None;
         self.event_task = None;
         self.clear_connection_bound_state();
         self.runtime = None;
         self.state = corbit_client::ConnectionState::Connecting;
-        self.detail = "正在读取 Daemon 连接配置".into();
+        self.detail = "正在检查本机 Corbit Daemon".into();
+        self.local_daemon_status = local_daemon::DaemonStatus::checking();
         self.clear_timeline();
         self.permissions.clear();
         self.retry_mutation = None;
@@ -568,6 +618,50 @@ impl ConnectionView {
         self.delete_confirmation = None;
 
         let endpoint = self.daemon_endpoint.clone();
+        self.daemon_preflight_task = Some(cx.spawn(async move |view, cx| {
+            let result = local_daemon::ensure_available(endpoint.clone()).await;
+            let Some(view) = view.upgrade() else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                if view.connection_generation != generation {
+                    return;
+                }
+                view.daemon_preflight_task = None;
+                match result {
+                    Ok(local_daemon::EnsureResult { outcome, status }) => {
+                        view.detail = match outcome {
+                            local_daemon::EnsureOutcome::NotManaged => {
+                                "正在读取 Daemon 连接配置".into()
+                            }
+                            local_daemon::EnsureOutcome::AlreadyRunning => {
+                                "本机 Daemon 已运行，正在读取连接配置".into()
+                            }
+                            local_daemon::EnsureOutcome::Started => {
+                                let version = status.version.as_deref().unwrap_or("未知版本");
+                                let node = status.node.as_ref().map_or_else(
+                                    || "未知 Node".into(),
+                                    |path| path.display().to_string(),
+                                );
+                                format!("已启动本机 Daemon {version}（{node}），正在读取连接配置")
+                            }
+                        };
+                        view.local_daemon_status = status;
+                        view.connect_after_daemon_preflight(endpoint, cx);
+                    }
+                    Err(error) => {
+                        view.state = corbit_client::ConnectionState::Offline;
+                        view.local_daemon_status = local_daemon::DaemonStatus::failed(&error);
+                        view.show_error(format!("无法准备本机 Corbit Daemon：{error:#}"), cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn connect_after_daemon_preflight(&mut self, endpoint: String, cx: &mut Context<Self>) {
         let credential = connection::resolve_credentials(&endpoint);
         self.credential_source = credential.source;
         self.system_credential_present = credential.system_credential_present;
@@ -651,22 +745,34 @@ impl ConnectionView {
         self.snapshot = None;
         self.server_info = None;
         self.provider_catalog = None;
+        self.provider_catalog_error = None;
         self.clear_workspace_files();
         self.clear_workspace_git();
         self.operation_in_flight = false;
         self.prompt_in_flight = false;
         self.control_in_flight = false;
         self.provider_switch_in_flight = false;
+        self.plugin_operation_in_flight = false;
         self.new_task_in_flight = false;
         self.device_operation_in_flight = false;
         self.mutation_task = None;
         self.prompt_task = None;
         self.control_task = None;
         self.provider_catalog_task = None;
+        self.provider_catalog_request_id = self.provider_catalog_request_id.wrapping_add(1);
+        self.provider_catalog_refresh_task = None;
         self.provider_switch_task = None;
+        self.plugin_task = None;
         self.new_task_task = None;
         self.device_task = None;
         self.devices.clear();
+        self.plugins.clear();
+        self.plugin_marketplace.clear();
+        self.plugin_audit.clear();
+        self.pending_plugin_uninstall = None;
+        self.pending_plugin_update = None;
+        self.pending_plugin_write = None;
+        self.pending_plugin_inspection = None;
         self.pairing_offer = None;
         self.pending_revoke_device_id = None;
         self.delete_confirmation = None;
@@ -677,6 +783,7 @@ impl ConnectionView {
         state: corbit_client::ConnectionState,
         cx: &mut Context<Self>,
     ) {
+        let is_online = matches!(&state, corbit_client::ConnectionState::Online);
         if !matches!(state, corbit_client::ConnectionState::Online) {
             self.clear_connection_bound_state();
         }
@@ -712,6 +819,9 @@ impl ConnectionView {
             _ => {}
         }
         self.state = state;
+        if is_online {
+            self.start_provider_catalog_if_ready(cx);
+        }
     }
 
     fn apply_connection_error(&mut self, message: &str, cx: &mut Context<Self>) {
@@ -736,40 +846,6 @@ impl ConnectionView {
         }
     }
 
-    fn load_provider_catalog(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self
-            .runtime
-            .as_ref()
-            .map(corbit_client::DaemonRuntime::client)
-        else {
-            return;
-        };
-        self.provider_catalog = None;
-        self.provider_catalog_task = Some(cx.spawn(async move |view, cx| {
-            let result = client.provider_catalog().await;
-            let Some(view) = view.upgrade() else {
-                return;
-            };
-            let _ = view.update(cx, |view, cx| {
-                match result {
-                    Ok(catalog) => {
-                        view.provider_catalog = Some(catalog);
-                        view.ensure_selected_provider();
-                        view.reconcile_composer_catalog();
-                    }
-                    Err(error) => {
-                        view.provider_catalog = Some(corbit_client::ProviderCatalog {
-                            providers: Vec::new(),
-                        });
-                        view.show_error(format!("无法读取本机模型目录：{error}"), cx);
-                    }
-                }
-                view.schedule_ui_state_save(cx);
-                cx.notify();
-            });
-        }));
-    }
-
     fn apply_event(&mut self, event: corbit_client::RuntimeEvent, cx: &mut Context<Self>) {
         match event {
             corbit_client::RuntimeEvent::HealthChecked => {
@@ -790,7 +866,6 @@ impl ConnectionView {
                 self.detail = format!("Daemon {} · 协议 {}", info.version, info.protocol_version);
                 self.server_info = Some(info);
                 self.ensure_selected_provider();
-                self.load_provider_catalog(cx);
                 self.schedule_ui_state_save(cx);
             }
             corbit_client::RuntimeEvent::Connection(
@@ -814,11 +889,17 @@ impl ConnectionView {
                 self.snapshot = Some(snapshot);
                 self.reconcile_selection();
                 self.reconcile_new_task_recovery();
+                self.start_provider_catalog_if_ready(cx);
                 self.schedule_ui_state_save(cx);
                 if self.main_section == MainSection::Resources
                     && self.resource_section == ResourceSection::Devices
                 {
                     self.load_devices(cx);
+                }
+                if self.main_section == MainSection::Resources
+                    && self.resource_section == ResourceSection::Plugins
+                {
+                    self.load_plugins(cx);
                 }
             }
             corbit_client::RuntimeEvent::Error(message) => {
@@ -842,6 +923,7 @@ impl ConnectionView {
             selected_agent_id: self.selected_agent_id.clone(),
             selected_provider: self.selected_provider.clone(),
             project_providers: self.project_providers.clone(),
+            composer_selections: self.composer_selections.clone(),
             task_filter: self.task_filter,
             new_task_draft: self.new_task_prompt.read(cx).value().to_string(),
             prompt_drafts: self.prompt_drafts.clone(),
@@ -968,6 +1050,9 @@ impl ConnectionView {
         cx.notify();
         if section == ResourceSection::Devices {
             self.load_devices(cx);
+        }
+        if section == ResourceSection::Plugins {
+            self.load_plugins(cx);
         }
     }
 

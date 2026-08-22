@@ -13,12 +13,15 @@ pub use corbit_protocol::{
     AgentPromptAttachment, AgentPromptOptions, AgentReasoningEffort, AgentResource, AgentStatus,
     AgentTimelineEvent, AgentTimelineFileChange, AgentTimelineFileChangeKind, AgentTimelinePayload,
     AgentTimelinePlanStep, AgentTimelineStepStatus, AgentTurnStatus, AuthoritativeSnapshot,
-    DeviceCredentialSummary, DeviceListResponse, PairingOffer, ProjectResource, ProviderCatalog,
-    ProviderCatalogEntry, ProviderModelInfo, ProviderReasoningEffortInfo,
-    ResourceMutationAcknowledgement, ServerInfo, WorkspaceChanged, WorkspaceDirectoryListing,
-    WorkspaceFileContent, WorkspaceFileEntry, WorkspaceFileEntryKind, WorkspaceGitChange,
-    WorkspaceGitChangeKind, WorkspaceGitDiff, WorkspaceGitStatus, WorkspaceResource,
-    WorkspaceStatus,
+    DeviceCredentialSummary, DeviceListResponse, PairingOffer, PluginAuditEntry, PluginAuditStatus,
+    PluginCapabilityUsage, PluginCommand, PluginCommandResult, PluginEntrypoint,
+    PluginEntrypointProtocol, PluginInspection, PluginInspectionOperation, PluginManifest,
+    PluginMarketplaceEntry, PluginPermission, PluginRecord, PluginRuntime, PluginSourceKind,
+    ProjectResource, ProviderCatalog, ProviderCatalogEntry, ProviderModelInfo,
+    ProviderReasoningEffortInfo, ResourceMutationAcknowledgement, ServerInfo, WorkspaceChanged,
+    WorkspaceDirectoryListing, WorkspaceFileContent, WorkspaceFileEntry, WorkspaceFileEntryKind,
+    WorkspaceGitChange, WorkspaceGitChangeKind, WorkspaceGitDiff, WorkspaceGitStatus,
+    WorkspaceResource, WorkspaceStatus,
 };
 pub use error::ClientError;
 pub use runtime::{DaemonRuntime, DaemonRuntimeClient, RuntimeEvent};

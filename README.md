@@ -29,6 +29,7 @@ flowchart LR
     Controller --> Client["corbit-client"]
     Client -->|"HTTP + WebSocket"| Daemon["corbit-daemon"]
     Daemon --> Providers["Codex / Claude / ACP"]
+    Daemon --> Plugins["内置 / 本地第三方插件"]
     Client --> Cache["非权威界面缓存"]
 ```
 
@@ -68,13 +69,37 @@ Corbit App 负责桌面交互、窗口和本地展示状态。Agent 生命周期
 7. 通过 `workspace.git.status` 检查限定到工作区的未提交变更，通过
    `workspace.git.diff` 预览单路径统一差异；桌面端不直接启动 Git，已实现。
 8. 订阅临时 `workspace.changed` 通知，按相对路径使当前目录、文本、Git 状态和 Diff
-   缓存失效；该通知不推进持久化事件游标，已实现。
-9. 资源操作携带稳定 `clientMutationId`，成功后重新获取权威快照，已实现。
-10. 订阅 `agent.timeline`，按 `turnId` 合并当前 Agent 的实时文本增量，已实现。
-11. 订阅 `agent.permission` 并通过 `agent.approval.resolve` 提交明确裁决，已实现。
-12. 通过 `agent.interrupt` 中断当前活动 Turn，已实现。
-13. 断线后携带最后已提交游标重连；Daemon 要求重置时清空本地事件状态并重放权威
+    缓存失效；该通知不推进持久化事件游标，已实现。
+9. 连接 `https://` Daemon Endpoint 时自动使用 `wss://` 业务通道；非回环 Daemon 现在会
+   强制配置 PEM 证书和私钥。桌面端依赖系统证书信任，局域网自签名证书引导仍待完成。
+10. 资源操作携带稳定 `clientMutationId`，成功后重新获取权威快照，已实现。
+11. 订阅 `agent.timeline`，按 `turnId` 合并当前 Agent 的实时文本增量，已实现。
+12. 订阅 `agent.permission` 并通过 `agent.approval.resolve` 提交明确裁决，已实现。
+13. 通过 `agent.interrupt` 中断当前活动 Turn，已实现。
+14. 断线后携带最后已提交游标重连；Daemon 要求重置时清空本地事件状态并重放权威
     时间线，已实现。
+15. 通过 `plugin.*` RPC 查看内置市场、安装本地插件目录或 `.corbit-plugin` 包、启停/卸载
+    插件并运行其命令；配置可信 HTTPS 市场后可安装通过索引签名、发布者签名、SHA-256
+    和完整 Manifest 校验的插件。显式声明 JSONL 入口的插件还可在当前工作区内使用
+    受权限约束的目录列表、UTF-8 文件读取、Git 状态、单文件 Diff 和受控文本写入
+    capability；设置页会
+    展示已安装插件、市场条目的权限范围、当前 Daemon 尚未提供能力宿主的权限，以及最近
+    的脱敏执行记录。声明工作区写入权限的命令必须由本机桌面端再次点击确认，授权绑定
+    当前选中的工作区且仅对本次命令有效；命令完成提示会显示不含
+    路径或内容的能力调用次数摘要，已实现。审计记录由 Daemon 持久化在
+    `$CORBIT_HOME/state/plugin-audit.json`，最多 200 条，仅本机根凭证可读；桌面端对旧
+    Daemon 缺少 `plugin.audit.list` 时降级为空记录。记录只展示插件/命令 ID、时间、状态、
+    稳定错误码和能力计数，不包含参数、路径、源码、文件内容、Diff 或错误消息。审计写入
+    失败不会影响插件命令本身，且该记录不是完整操作系统沙箱。已验签且未过期的市场索引
+    会由 Daemon 私有缓存，重启或临时断网仍可展示可信条目；缓存会绑定市场地址并在恢复时
+    重新验证签名。签名市场存在更高 SemVer
+    版本时会展示当前/目标版本并允许更新；更新保持原启用状态，拒绝降级、发布者变更和
+    内置插件覆盖，新增权限必须在设置页二次确认。本地插件先由 Daemon 完整预检，设置页
+    展示名称、ID、发布者、版本、权限、命令、来源类型和指纹摘要；预检会区分新装与更新，
+    更新时显示当前版本、目标版本和新增权限；确认后仅使用五分钟
+    有效的一次性预检令牌安装。Daemon 会再次比对整包指纹，源文件变化、令牌过期或重复
+    使用都会拒绝，且预检响应不包含源绝对路径。能力宿主状态由 Daemon 在市场、预检和
+    已安装插件响应中统一返回；旧 Daemon 缺少该字段时桌面端按空列表兼容。
 
 协议由 `corbit-daemon` 工程维护。桌面端不得自行增加仅有 Rust 能理解的线协议字段。
 
@@ -102,6 +127,8 @@ corbit-app/
 │               ├── connection.rs   # Endpoint 持久化与系统凭证存储
 │               ├── discovery.rs    # 全局搜索与活动中心
 │               ├── event_batch.rs  # 高频时间线增量的有界帧批处理
+│               ├── provider_selection.rs # 按 Agent/Provider 隔离并恢复模型与推理选择
+│               ├── plugins.rs      # 插件市场、本地安装、启停、卸载和命令运行
 │               ├── resources.rs    # Project / Workspace / Agent 管理
 │               ├── settings.rs     # 连接、Provider、快捷键、设备和关于设置
 │               ├── tasks.rs        # 新建任务、任务总览和状态筛选
@@ -208,7 +235,9 @@ bash scripts/generate_brand_assets.sh
 - `WorkspaceGit`：当前 Git 分支、未提交路径和单路径统一差异；非仓库作为普通空状态
   展示，切换工作区或断线即清空，在线时由工作区变化通知自动刷新。
 - `EphemeralUiState`：项目/工作区/Agent 选中项、搜索/筛选条件、表单草稿、窗口位置、
-  左侧栏与 Files/Changes 分栏宽度已实现；拖拽结束后写入本地界面状态。
+  左侧栏与 Files/Changes 分栏宽度，以及按 Agent/Provider 隔离的模型与推理等级选择
+  已实现；交互结束后写入本地界面状态。全局默认 Provider 只用于新任务，当前任务
+  切换不会反向修改该默认值。
 - `ReplicaCache`：可选的有限展示缓存，不用于确认操作结果，尚未实现。
 
 恢复缓存后界面必须标明仍在连接；远端同步完成前不能把旧权限请求视为有效。
@@ -228,10 +257,11 @@ bash scripts/generate_brand_assets.sh
 | Agent 时间线      | 已完成权威恢复闭环       | 展示 Prompt、文本增量和完成状态，断线后按游标补齐       |
 | 时间线增量批处理  | 已完成有界帧批处理       | 16ms/256 条上限，状态边界有序且每批仅触发一次重绘       |
 | 长时间线虚拟渲染  | 已完成可变高度虚拟列表   | 仅创建可见 Turn 与过绘区域，并按 Agent/Turn 索引定位    |
-| Prompt 编辑与发送 | 已完成实时闭环           | 运行中的可用 Provider Agent 可提交，失败复用 mutation ID |
+| Prompt 编辑与发送 | 已完成实时闭环           | 实时 Provider 目录、会话级模型/推理选择，失败复用 mutation ID |
 | 权限批准/拒绝     | 已完成实时闭环           | 仅展示 Daemon 推送的可用决定，由 Daemon 最终裁决        |
 | Turn 中断         | 已完成实时闭环           | 仅活动 Turn 可中断，完成状态由时间线事件确认            |
 | 设置与设备配对    | 已完成真实 HTTP 闭环      | Codex 风格设置、连接配置、macOS 钥匙串、配对与设备撤销  |
+| 插件管理与运行    | 已完成预检、更新与审计闭环 | 一次性令牌确认安装、可信更新、权限升级确认、启停/卸载、受控命令、读写能力和脱敏审计记录 |
 | 导航快捷键        | 已完成                   | 新建、搜索、任务、活动和设置全局切换                    |
 | 左侧栏可调宽度    | 已完成                   | 默认对齐 Codex，右边缘可拖拽并跨启动恢复                |
 | 工作区可调分栏    | 已完成                   | Files/Changes 列表与预览宽度可拖拽并跨启动恢复          |
@@ -276,11 +306,20 @@ GPUI Component 的上游支持矩阵不等于 Corbit App 已在对应平台通�
 
 ## Daemon 生命周期
 
-桌面端可以提供以下能力，但不能混淆服务所有权：
+桌面端会严格区分自己管理的 Daemon 与外部 Daemon：
 
-- 检测 Daemon 是否安装、运行和兼容。
-- 引导安装或升级 Daemon。
-- 请求操作系统服务管理器启动 Daemon。
+- 检测 Daemon 是否安装、运行和兼容；兼容的外部 Daemon 只复用，不停止或覆盖。
+- 首次连接前校验应用包内的精确版本和内容指纹，并原子安装到
+  `$CORBIT_HOME/desktop/runtimes/daemon/<版本>/<平台>-<架构>/`；损坏的受管副本会自动修复，
+  即使版本号未变化，内容更新也会替换旧副本；没有 Corbit 安装标记的同名目录不会被覆盖。
+- 使用系统安装的 Node.js 24 启动私有运行包；运行身份、PID、Node、运行包和日志路径可在
+  常规设置中查看并复制诊断。
+- macOS 正式版通过当前用户的 `com.xiaoxi.corbit.daemon` LaunchAgent 托管 Daemon，桌面
+  窗口退出后继续运行，并由 launchd 在异常退出后恢复；开发版仍使用受控直接进程，避免
+  调试构建注册或覆盖正式服务。Windows Service 与 Linux systemd user service 尚未接入，
+  当前继续使用相同生命周期接口的直接进程后端。显式提供 `CORBIT_AUTH_TOKEN` 或设置
+  `CORBIT_DAEMON_SERVICE=direct` 时，macOS 也使用直接进程，避免把 Token 写入 LaunchAgent
+  plist；LaunchAgent 的 PATH 会包含已检测 Node 所在目录和常见 CLI 安装目录。
 - 打开日志和诊断目录。
 
 正常关闭窗口只关闭 UI。显式“停止 Daemon”必须单独确认，因为这可能中断所有
@@ -299,10 +338,11 @@ make dev
 make dev
 ```
 
-`corbit-app` 中的 `make dev` 只启动桌面端，要求 Daemon 已在运行。如果启动 Daemon 时
-显式设置了 `CORBIT_AUTH_TOKEN`，桌面端也必须使用同一个 Token，或在 macOS 常规设置中
-手动保存；如果 Daemon 不在默认地址，可在设置中保存地址，或临时设置
-`CORBIT_DAEMON_URL="http://127.0.0.1:端口"`。
+`corbit-app` 中的 `make dev` 启动桌面端；默认本机 Daemon 未运行时，桌面端会从应用包校验、
+安装并启动与当前桌面版本精确匹配的私有运行包。如果已经手动启动 Daemon 且显式设置了
+`CORBIT_AUTH_TOKEN`，桌面端也必须使用同一个 Token，或在 macOS 常规设置中手动保存；
+如果 Daemon 不在默认地址，可在设置中保存地址，或临时设置
+`CORBIT_DAEMON_URL="http://127.0.0.1:端口"`。自动安装只管理默认本机端点。
 
 `make dev` 会先完成构建，再停止本工程 PID 文件追踪的旧调试实例并启动新实例；它不会
 按进程名批量结束其他工程或正式版进程。在 macOS 上，开发命令还会把调试二进制和当前
@@ -323,7 +363,12 @@ make dev
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 bash scripts/generate_brand_assets.sh
+make daemon-smoke
 ```
+
+`make daemon-smoke` 会打包当前主机对应的 Daemon，在独立临时 `CORBIT_HOME` 和随机端口中
+启动它，验证 `/health`、带认证的 `/info`、版本、平台、架构和桌面所有权身份，随后只停止
+该测试子进程并删除临时目录；不会连接、停止或修改用户正在运行的 Daemon。
 
 ## 多平台构建
 
@@ -360,6 +405,8 @@ Cargo 缓存不可写，可为本次任务设置独立的 `CARGO_HOME`，不要�
   用户的真实钥匙串项目。
 - `daemon_e2e` ignored test 可在显式提供测试 Daemon URL/Token 时验证真实服务，
   不会让日常测试隐式启动或修改用户 Daemon。
+- 桌面打包后的 Daemon runtime 会执行隔离 smoke test；它验证可执行运行包和基础 HTTP
+  身份链路，但不等同于外部 Provider、Agent CLI 或真实用户服务的 E2E 验证。
 - View 测试空状态、加载、离线、认证失败和不兼容版本。
 - 终端与长时间线仍需要真机性能基准；长时间线虚拟化已经实现，不能只用编译成功证明
   实际帧率和内存表现。
@@ -389,6 +436,8 @@ Cargo 缓存不可写，可为本次任务设置独立的 `CARGO_HOME`，不要�
 - [x] 增加统一 Logo、GPUI 品牌组件及 macOS/Windows 图标资产。
 - [x] 增加 Codex 风格新建任务、任务总览、全局审批和独立双栏设置界面。
 - [x] 增加移动端一次性配对链接、配对设备列表和凭证撤销界面。
+- [x] 兼容配对响应中的可选 TLS 证书 SHA-256 指纹，由 Flutter 移动端执行证书固定。
+- [x] 增加内置插件市场、本地第三方插件安装/管理和受控命令调用。
 - [x] 增加 Endpoint 持久化、启动自动连接和 macOS 钥匙串 Token 管理。
 - [x] 增加 Files/Changes 可调分栏并持久化面板宽度。
 - [ ] 增加分栏和多窗口。

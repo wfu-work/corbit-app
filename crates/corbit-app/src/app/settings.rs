@@ -6,6 +6,7 @@ impl ConnectionView {
             ResourceSection::General => "常规",
             ResourceSection::Appearance => "外观",
             ResourceSection::Providers => "模型提供商",
+            ResourceSection::Plugins => "插件",
             ResourceSection::Shortcuts => "快捷键",
             ResourceSection::Projects => "项目",
             ResourceSection::Workspaces => "工作区",
@@ -402,6 +403,91 @@ impl ConnectionView {
         self.connect(cx);
     }
 
+    fn refresh_daemon_diagnostics(&mut self, cx: &mut Context<Self>) {
+        if self.daemon_action_task.is_some() {
+            return;
+        }
+        self.local_daemon_status = local_daemon::DaemonStatus::checking();
+        let endpoint = self.daemon_endpoint.clone();
+        let endpoint_for_request = endpoint.clone();
+        self.daemon_action_task = Some(cx.spawn(async move |view, cx| {
+            let result = local_daemon::diagnose(endpoint).await;
+            let Some(view) = view.upgrade() else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.daemon_action_task = None;
+                if view.daemon_endpoint != endpoint_for_request {
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(status) => {
+                        view.local_daemon_status = status;
+                        view.show_success("Daemon 诊断信息已刷新", cx);
+                    }
+                    Err(error) => {
+                        view.local_daemon_status = local_daemon::DaemonStatus::failed(&error);
+                        view.show_error(format!("Daemon 检测失败：{error:#}"), cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn restart_local_daemon(&mut self, cx: &mut Context<Self>) {
+        if self.daemon_action_task.is_some() || self.daemon_preflight_task.is_some() {
+            return;
+        }
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.daemon_preflight_task = None;
+        self.event_task = None;
+        self.runtime = None;
+        self.clear_connection_bound_state();
+        self.state = corbit_client::ConnectionState::Connecting;
+        self.detail = "正在安全重启本机 Corbit Daemon".into();
+        self.local_daemon_status = local_daemon::DaemonStatus::restarting();
+        let endpoint = self.daemon_endpoint.clone();
+        self.daemon_action_task = Some(cx.spawn(async move |view, cx| {
+            let result = local_daemon::restart_owned(endpoint).await;
+            let Some(view) = view.upgrade() else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.daemon_action_task = None;
+                match result {
+                    Ok(status) => {
+                        view.local_daemon_status = status;
+                        view.show_success("本机 Daemon 已安全重启，正在重新连接", cx);
+                        view.connect(cx);
+                    }
+                    Err(error) => {
+                        view.state = corbit_client::ConnectionState::Offline;
+                        view.local_daemon_status = local_daemon::DaemonStatus::failed(&error);
+                        view.show_error(format!("无法安全重启本机 Daemon：{error:#}"), cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn open_daemon_logs(&mut self, cx: &mut Context<Self>) {
+        match local_daemon::open_log_directory() {
+            Ok(()) => self.show_info("已打开 Daemon 日志目录", cx),
+            Err(error) => self.show_error(format!("无法打开 Daemon 日志目录：{error:#}"), cx),
+        }
+    }
+
+    fn copy_daemon_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let diagnostics = self.local_daemon_status.diagnostics(&self.daemon_endpoint);
+        cx.write_to_clipboard(ClipboardItem::new_string(diagnostics));
+        self.show_success("Daemon 诊断信息已复制到剪贴板", cx);
+    }
+
     fn delete_saved_connection_credential(&mut self, cx: &mut Context<Self>) {
         match connection::delete_system_credential() {
             Ok(removed) => {
@@ -446,17 +532,22 @@ impl ConnectionView {
             info.features.values().filter(|enabled| **enabled).count()
         });
         let daemon_synchronized = self.server_info.is_some();
+        let provider_catalog_synchronized = self.provider_catalog.is_some();
         let provider_options = self.provider_options();
-        let provider_summary = if daemon_synchronized {
+        let provider_summary = if self.provider_catalog_error.is_some() {
+            "目录读取失败".to_owned()
+        } else if provider_catalog_synchronized {
             provider_options
                 .iter()
                 .map(|(_, label, _)| *label)
                 .collect::<Vec<_>>()
                 .join("、")
+        } else if daemon_synchronized {
+            "正在读取本机 Provider".to_owned()
         } else {
             "尚未同步".to_owned()
         };
-        let providers_available = daemon_synchronized && !provider_options.is_empty();
+        let providers_available = provider_catalog_synchronized && !provider_options.is_empty();
         let is_connecting = matches!(
             self.state,
             corbit_client::ConnectionState::Connecting
@@ -496,6 +587,20 @@ impl ConnectionView {
         } else {
             "当前平台暂不保存 Token，请通过 CORBIT_AUTH_TOKEN 提供凭证。"
         };
+        let daemon_status = &self.local_daemon_status;
+        let daemon_status_color = match daemon_status.phase {
+            local_daemon::DaemonPhase::Ready => rgb(COLOR_SUCCESS),
+            local_daemon::DaemonPhase::Blocked | local_daemon::DaemonPhase::Failed => {
+                rgb(COLOR_WARNING)
+            }
+            _ => rgb(COLOR_TEXT_TERTIARY),
+        };
+        let daemon_action_busy =
+            self.daemon_action_task.is_some() || self.daemon_preflight_task.is_some();
+        let daemon_can_restart = !daemon_action_busy
+            && daemon_status.phase != local_daemon::DaemonPhase::Unmanaged
+            && (daemon_status.phase == local_daemon::DaemonPhase::Offline
+                || daemon_status.desktop_owned);
 
         settings_page_header("常规", "连接状态、Daemon 身份和当前运行能力。")
             .when_some(self.connection_settings_error.clone(), |page, error| {
@@ -622,6 +727,124 @@ impl ConnectionView {
                                     .loading(is_connecting)
                                     .disabled(is_connecting)
                                     .on_click(cx.listener(|view, _, _, cx| view.connect(cx))),
+                            ),
+                    ),
+            )
+            .child(
+                settings_card("本机 Daemon 管理")
+                    .child(setting_value_row(
+                        "运行状态",
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .child(div().size(px(6.)).rounded_full().bg(daemon_status_color))
+                            .child(daemon_status.phase.label()),
+                    ))
+                    .child(setting_text_row(
+                        "期望版本",
+                        daemon_status.expected_version.clone(),
+                    ))
+                    .child(setting_text_row(
+                        "运行版本",
+                        daemon_status.version.clone().unwrap_or_else(|| "—".into()),
+                    ))
+                    .child(setting_text_row(
+                        "进程所有权",
+                        if daemon_status.desktop_owned {
+                            "Corbit Desktop"
+                        } else {
+                            "外部或无"
+                        },
+                    ))
+                    .child(setting_text_row(
+                        "托管方式",
+                        daemon_status
+                            .launch_mode
+                            .map_or_else(|| "外部进程".to_owned(), |mode| mode.label().to_owned()),
+                    ))
+                    .child(setting_text_row(
+                        "进程 PID",
+                        daemon_status
+                            .pid
+                            .map_or_else(|| "—".into(), |pid| pid.to_string()),
+                    ))
+                    .child(setting_text_row(
+                        "Node.js",
+                        daemon_status.node.as_ref().map_or_else(
+                            || "—".into(),
+                            |path| path.display().to_string(),
+                        ),
+                    ))
+                    .child(setting_text_row(
+                        "私有运行包",
+                        daemon_status.runtime_path.as_ref().map_or_else(
+                            || "—".into(),
+                            |path| path.display().to_string(),
+                        ),
+                    ))
+                    .child(setting_text_row(
+                        "日志文件",
+                        daemon_status.log_path.as_ref().map_or_else(
+                            || "—".into(),
+                            |path| path.display().to_string(),
+                        ),
+                    ))
+                    .child(
+                        div()
+                            .text_size(font_px(FONT_SIZE_XS))
+                            .line_height(px(18.))
+                            .text_color(rgb(COLOR_TEXT_TERTIARY))
+                            .child(daemon_status.detail.clone()),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .pt_1()
+                            .child(
+                                Button::new("settings-refresh-daemon-diagnostics")
+                                    .outline()
+                                    .small()
+                                    .icon(Icon::new(AppIcon::Refresh))
+                                    .label("重新检测")
+                                    .loading(daemon_status.phase.is_busy())
+                                    .disabled(daemon_action_busy)
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.refresh_daemon_diagnostics(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("settings-restart-local-daemon")
+                                    .primary()
+                                    .small()
+                                    .icon(Icon::new(AppIcon::Refresh))
+                                    .label("安全重启")
+                                    .loading(daemon_status.phase == local_daemon::DaemonPhase::Restarting)
+                                    .disabled(!daemon_can_restart)
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.restart_local_daemon(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("settings-open-daemon-logs")
+                                    .outline()
+                                    .small()
+                                    .icon(Icon::new(AppIcon::FolderOpen))
+                                    .label("打开日志")
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.open_daemon_logs(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("settings-copy-daemon-diagnostics")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(AppIcon::Copy))
+                                    .label("复制诊断")
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.copy_daemon_diagnostics(cx);
+                                    })),
                             ),
                     ),
             )
@@ -978,24 +1201,31 @@ impl ConnectionView {
     }
 
     pub(super) fn render_provider_settings(&self, cx: &mut Context<Self>) -> Div {
-        let daemon_synchronized = self.server_info.is_some();
-        let available_provider_count = PROVIDER_SETTINGS
-            .iter()
-            .filter(|provider| self.feature_enabled(provider.feature))
-            .count();
-        let selected_provider_label = PROVIDER_SETTINGS
+        let daemon_synchronized = self.provider_catalog.is_some();
+        let has_catalog_entries = self
+            .provider_catalog
+            .as_ref()
+            .is_some_and(|catalog| !catalog.providers.is_empty());
+        let available_provider_count = self.provider_options().len();
+        let selected_provider_label = PROVIDERS
             .iter()
             .find(|provider| provider.id == self.selected_provider)
             .map_or_else(
                 || self.selected_provider.clone(),
                 |provider| provider.label.to_owned(),
             );
-        let availability_summary = if daemon_synchronized {
+        let availability_summary = if self.provider_catalog_error.is_some() && has_catalog_entries {
+            "刷新失败，继续使用上次同步结果".to_owned()
+        } else if self.provider_catalog_error.is_some() {
+            "Provider 目录读取失败".to_owned()
+        } else if daemon_synchronized {
             format!("当前 Daemon 已启用 {available_provider_count} 个")
+        } else if self.server_info.is_some() {
+            "正在读取 Daemon Provider 目录".to_owned()
         } else {
             "连接 Daemon 后自动检测".to_owned()
         };
-        let cards = PROVIDER_SETTINGS
+        let cards = PROVIDERS
             .iter()
             .enumerate()
             .map(|(index, provider)| {
@@ -1003,7 +1233,7 @@ impl ConnectionView {
                     index,
                     provider,
                     self.selected_provider == provider.id,
-                    self.feature_enabled(provider.feature),
+                    self.provider_is_available(provider.id),
                     daemon_synchronized,
                     cx,
                 )
@@ -1022,6 +1252,12 @@ impl ConnectionView {
                     .child(settings_row_divider())
                     .child(setting_text_row("保存方式", "自动保存在本机界面偏好中")),
             )
+            .child(provider_catalog_settings_card(
+                self,
+                daemon_synchronized,
+                has_catalog_entries,
+                cx,
+            ))
             .child(
                 settings_section(
                     "可选择的模型提供商",
@@ -1273,14 +1509,24 @@ impl ConnectionView {
                                 div()
                                     .text_size(font_px(FONT_SIZE_HEADING))
                                     .font_semibold()
-                                    .child("Corbit"),
+                                    .child(if build_info::is_development() {
+                                        "Corbit Dev"
+                                    } else {
+                                        "Corbit"
+                                    }),
                             )
                             .child(
                                 div()
                                     .text_color(rgb(COLOR_TEXT_SECONDARY))
-                                    .child(format!("Desktop {}", env!("CARGO_PKG_VERSION"))),
+                                    .child(build_info::version_label()),
                             ),
                     ),
+            )
+            .child(
+                settings_card("构建信息")
+                    .child(setting_text_row("渠道", build_info::channel_label()))
+                    .child(settings_row_divider())
+                    .child(setting_text_row("目标", build_info::TARGET)),
             )
             .child(
                 settings_card("工作方式")
@@ -1298,41 +1544,9 @@ impl ConnectionView {
     }
 }
 
-struct ProviderSetting {
-    id: &'static str,
-    label: &'static str,
-    feature: &'static str,
-    description: &'static str,
-    detail: &'static str,
-}
-
-const PROVIDER_SETTINGS: [ProviderSetting; 3] = [
-    ProviderSetting {
-        id: "codex",
-        label: "Codex",
-        feature: "codexProviderSessions",
-        description: "OpenAI Codex 本机 Agent 会话",
-        detail: "通过 Codex app-server 创建、恢复并继续任务。",
-    },
-    ProviderSetting {
-        id: "claude",
-        label: "Claude",
-        feature: "claudeProviderSessions",
-        description: "Anthropic Claude Code Agent 会话",
-        detail: "通过 Claude Agent SDK 运行，并沿用 Daemon 主机上的登录状态。",
-    },
-    ProviderSetting {
-        id: "acp",
-        label: "ACP",
-        feature: "acpProviderSessions",
-        description: "兼容 Agent Client Protocol 的 Agent 会话",
-        detail: "需在 Daemon 中配置 CORBIT_ACP_COMMAND 后启用。",
-    },
-];
-
 fn provider_setting_card(
     index: usize,
-    provider: &ProviderSetting,
+    provider: &ProviderInfo,
     selected: bool,
     enabled: bool,
     daemon_synchronized: bool,
@@ -1378,7 +1592,7 @@ fn provider_setting_card(
             COLOR_SURFACE
         }))
         .p_4()
-        .child(provider_logo(provider.id, 36.))
+        .child(provider_badge(provider.id, ProviderBadgeSize::Settings))
         .child(
             div()
                 .v_flex()
@@ -1433,7 +1647,7 @@ fn provider_setting_card(
         )
 }
 
-fn settings_page_header(title: &'static str, description: &'static str) -> Div {
+pub(super) fn settings_page_header(title: &'static str, description: &'static str) -> Div {
     div().v_flex().w_full().gap_6().child(
         div()
             .v_flex()
@@ -1453,7 +1667,7 @@ fn settings_page_header(title: &'static str, description: &'static str) -> Div {
     )
 }
 
-fn settings_card(title: &'static str) -> Div {
+pub(super) fn settings_card(title: &'static str) -> Div {
     div()
         .v_flex()
         .gap_3()
@@ -1463,6 +1677,66 @@ fn settings_card(title: &'static str) -> Div {
         .bg(rgb(COLOR_SURFACE))
         .p_4()
         .child(div().font_medium().child(title))
+}
+
+fn provider_catalog_settings_card(
+    view: &ConnectionView,
+    daemon_synchronized: bool,
+    has_catalog_entries: bool,
+    cx: &mut Context<ConnectionView>,
+) -> Div {
+    let refreshing = view.provider_catalog_task.is_some();
+    let is_online = matches!(view.state, corbit_client::ConnectionState::Online);
+    let status = if refreshing {
+        "正在刷新"
+    } else if view.provider_catalog_error.is_some() && has_catalog_entries {
+        "刷新失败，已保留上次结果"
+    } else if view.provider_catalog_error.is_some() {
+        "目录读取失败"
+    } else if daemon_synchronized {
+        "已同步"
+    } else {
+        "等待连接"
+    };
+    let status_color = if refreshing {
+        COLOR_TEXT_SECONDARY
+    } else if view.provider_catalog_error.is_some() {
+        COLOR_WARNING
+    } else if daemon_synchronized {
+        COLOR_SUCCESS
+    } else {
+        COLOR_TEXT_TERTIARY
+    };
+
+    settings_card("实时模型目录")
+        .child(setting_value_row(
+            "同步状态",
+            div()
+                .h_flex()
+                .items_center()
+                .gap_2()
+                .child(div().size(px(6.)).rounded_full().bg(rgb(status_color)))
+                .child(status),
+        ))
+        .child(
+            div()
+                .text_size(font_px(FONT_SIZE_XS))
+                .line_height(px(18.))
+                .text_color(rgb(COLOR_TEXT_TERTIARY))
+                .child("目录来自当前 Daemon 的实时能力检测，后台会每分钟自动刷新。"),
+        )
+        .child(
+            Button::new("settings-refresh-provider-catalog")
+                .outline()
+                .small()
+                .icon(Icon::new(AppIcon::Refresh))
+                .label("立即刷新")
+                .loading(refreshing)
+                .disabled(!is_online || refreshing)
+                .on_click(cx.listener(|view, _, _, cx| {
+                    view.refresh_provider_catalog(cx);
+                })),
+        )
 }
 
 fn appearance_theme_card(

@@ -8,7 +8,8 @@ use async_channel::{Receiver, Sender};
 use corbit_protocol::{
     AgentApprovalDecision, AgentApprovalResolveAcknowledgement, AgentInterruptAcknowledgement,
     AgentPromptAcknowledgement, AgentPromptOptions, AuthoritativeSnapshot, DeviceCredentialSummary,
-    PairingOffer, ProviderCatalog, ResourceMutationAcknowledgement, WorkspaceDirectoryListing,
+    PairingOffer, PluginAuditEntry, PluginCommandResult, PluginInspection, PluginMarketplaceEntry,
+    PluginRecord, ProviderCatalog, ResourceMutationAcknowledgement, WorkspaceDirectoryListing,
     WorkspaceFileContent, WorkspaceGitDiff, WorkspaceGitStatus,
 };
 use serde_json::Value;
@@ -137,6 +138,185 @@ impl DaemonRuntimeClient {
     /// when the response cannot be decoded.
     pub async fn provider_catalog(&self) -> Result<ProviderCatalog, ClientError> {
         let value = self.rpc("provider.catalog.list", None).await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Lists installed built-in and local plugins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is offline or the response is invalid.
+    pub async fn plugins(&self) -> Result<Vec<PluginRecord>, ClientError> {
+        let value = self.rpc("plugin.list", None).await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Lists the Daemon-provided plugin marketplace entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is offline or the response is invalid.
+    pub async fn plugin_marketplace(&self) -> Result<Vec<PluginMarketplaceEntry>, ClientError> {
+        let value = self.rpc("plugin.marketplace.list", None).await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Lists recent redacted plugin command audit entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is offline, the credential is not the
+    /// local root credential, or the response is invalid.
+    pub async fn plugin_audit(
+        &self,
+        limit: Option<u32>,
+    ) -> Result<Vec<PluginAuditEntry>, ClientError> {
+        let params = limit.map(|limit| serde_json::json!({ "limit": limit }));
+        let value = self.rpc("plugin.audit.list", params).await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Installs a local plugin directory containing `manifest.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is offline, the package is invalid, or
+    /// the Daemon rejects the operation.
+    pub async fn install_plugin(
+        &self,
+        path: impl Into<String>,
+    ) -> Result<PluginRecord, ClientError> {
+        let value = self
+            .rpc(
+                "plugin.install",
+                Some(serde_json::json!({ "path": path.into() })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Performs a complete local plugin validation and returns a short-lived,
+    /// daemon-owned confirmation token without exposing the local path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when offline, when the package is invalid, or when the
+    /// connected Daemon does not support plugin inspection.
+    pub async fn inspect_plugin(
+        &self,
+        path: impl Into<String>,
+    ) -> Result<PluginInspection, ClientError> {
+        let value = self
+            .rpc(
+                "plugin.inspect",
+                Some(serde_json::json!({ "path": path.into() })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Installs the exact plugin source represented by a short-lived inspection token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when offline, when the token expired, or when the local
+    /// source changed after inspection.
+    pub async fn install_inspected_plugin(
+        &self,
+        inspection_id: impl Into<String>,
+    ) -> Result<PluginRecord, ClientError> {
+        let value = self
+            .rpc(
+                "plugin.install",
+                Some(serde_json::json!({
+                    "inspectionId": inspection_id.into()
+                })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Installs a verified plugin from the Daemon's signed marketplace index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is offline, the marketplace is unavailable,
+    /// or the Daemon rejects the signature, integrity, or package validation.
+    pub async fn install_marketplace_plugin(
+        &self,
+        plugin_id: impl Into<String>,
+        version: Option<String>,
+    ) -> Result<PluginRecord, ClientError> {
+        let mut params = serde_json::json!({ "pluginId": plugin_id.into() });
+        if let Some(version) = version {
+            params["version"] = serde_json::Value::String(version);
+        }
+        let value = self.rpc("plugin.marketplace.install", Some(params)).await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Enables or disables one installed plugin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is offline or the Daemon rejects the operation.
+    pub async fn set_plugin_enabled(
+        &self,
+        plugin_id: impl Into<String>,
+        enabled: bool,
+    ) -> Result<PluginRecord, ClientError> {
+        let method = if enabled {
+            "plugin.enable"
+        } else {
+            "plugin.disable"
+        };
+        let value = self
+            .rpc(
+                method,
+                Some(serde_json::json!({ "pluginId": plugin_id.into() })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Uninstalls one local plugin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is offline or the Daemon rejects the operation.
+    pub async fn uninstall_plugin(&self, plugin_id: impl Into<String>) -> Result<(), ClientError> {
+        self.rpc(
+            "plugin.uninstall",
+            Some(serde_json::json!({ "pluginId": plugin_id.into() })),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Invokes a command exposed by an enabled plugin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is offline, the command is unavailable,
+    /// or the Daemon rejects the plugin process execution.
+    pub async fn execute_plugin_command(
+        &self,
+        plugin_id: impl Into<String>,
+        command_id: impl Into<String>,
+        workspace_id: Option<String>,
+        allow_workspace_write: bool,
+    ) -> Result<PluginCommandResult, ClientError> {
+        let mut params = serde_json::json!({
+            "pluginId": plugin_id.into(),
+            "commandId": command_id.into(),
+        });
+        if let Some(workspace_id) = workspace_id {
+            params["workspaceId"] = serde_json::Value::String(workspace_id);
+        }
+        if allow_workspace_write {
+            params["approvedPermissions"] = serde_json::json!(["workspace.write"]);
+        }
+        let value = self.rpc("plugin.invoke", Some(params)).await?;
         serde_json::from_value(value).map_err(Into::into)
     }
 
@@ -689,11 +869,16 @@ async fn run_attempt(
             }
         },
     };
+    // Publish the session before the snapshot event reaches the UI. This
+    // keeps RPCs triggered by snapshot reconciliation (for example the live
+    // Provider catalog request) from observing a transient `NotConnected`
+    // state while the event is still being delivered.
+    let _ = active_session.send(Some(connection.clone()));
     if events.send(RuntimeEvent::Snapshot(snapshot)).await.is_err() {
+        let _ = active_session.send(None);
         let _ = connection.close().await;
         return AttemptOutcome::Shutdown;
     }
-    let _ = active_session.send(Some(connection.clone()));
 
     let mut heartbeat = interval(client.heartbeat_interval());
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);

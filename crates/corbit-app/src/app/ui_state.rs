@@ -9,7 +9,7 @@ use gpui::{Bounds, WindowBounds, point, px, size};
 use serde::{Deserialize, Serialize};
 
 use super::theme::{SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
-use super::{MainSection, PendingNewTaskRecovery, ResourceSection, TaskFilter};
+use super::{ComposerSelections, MainSection, PendingNewTaskRecovery, ResourceSection, TaskFilter};
 
 const MIN_WINDOW_WIDTH: f32 = 720.;
 const MIN_WINDOW_HEIGHT: f32 = 520.;
@@ -174,6 +174,7 @@ pub(super) struct UiPreferences {
     pub(super) selected_agent_id: Option<String>,
     pub(super) selected_provider: String,
     pub(super) project_providers: BTreeMap<String, String>,
+    pub(super) composer_selections: ComposerSelections,
     pub(super) task_filter: TaskFilter,
     pub(super) new_task_draft: String,
     pub(super) prompt_drafts: BTreeMap<String, String>,
@@ -194,6 +195,7 @@ impl Default for UiPreferences {
             selected_agent_id: None,
             selected_provider: "codex".into(),
             project_providers: BTreeMap::new(),
+            composer_selections: ComposerSelections::default(),
             task_filter: TaskFilter::All,
             new_task_draft: String::new(),
             prompt_drafts: BTreeMap::new(),

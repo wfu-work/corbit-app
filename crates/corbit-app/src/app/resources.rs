@@ -352,6 +352,7 @@ impl ConnectionView {
             self.clear_workspace_files();
             self.clear_workspace_git();
         }
+        self.reconcile_composer_catalog();
     }
 
     pub(super) fn select_project(&mut self, project_id: &str, cx: &mut Context<Self>) {
@@ -849,6 +850,22 @@ impl ConnectionView {
                     .justify_end()
                     .pl(px(TITLEBAR_LEFT_PADDING))
                     .pr_2()
+                    .when(build_info::is_development(), |toolbar| {
+                        toolbar.child(
+                            div()
+                                .flex_none()
+                                .rounded(px(5.))
+                                .border_1()
+                                .border_color(rgb(COLOR_BORDER_HEAVY))
+                                .bg(rgb(COLOR_SURFACE_SECONDARY))
+                                .px_1p5()
+                                .py_0p5()
+                                .text_size(font_px(FONT_SIZE_XS))
+                                .font_semibold()
+                                .text_color(rgb(COLOR_TEXT_SECONDARY))
+                                .child("DEV"),
+                        )
+                    })
                     .child(
                         Button::new("sidebar-collapse")
                             .ghost()
@@ -2714,6 +2731,7 @@ impl ConnectionView {
             ResourceSection::General => self.render_general_settings(is_online, cx),
             ResourceSection::Appearance => self.render_appearance_settings(cx),
             ResourceSection::Providers => self.render_provider_settings(cx),
+            ResourceSection::Plugins => self.render_plugin_settings(is_online, cx),
             ResourceSection::Shortcuts => Self::render_shortcut_settings(),
             ResourceSection::Projects => project_panel,
             ResourceSection::Workspaces => workspace_panel,
@@ -2824,6 +2842,25 @@ impl ConnectionView {
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.set_resource_section(
                                                     ResourceSection::Providers,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("settings-plugins")
+                                            .ghost()
+                                            .small()
+                                            .h(navigation_row_height())
+                                            .w_full()
+                                            .justify_start()
+                                            .selected(
+                                                self.resource_section == ResourceSection::Plugins,
+                                            )
+                                            .icon(Icon::new(AppIcon::Tool))
+                                            .label("插件")
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.set_resource_section(
+                                                    ResourceSection::Plugins,
                                                     cx,
                                                 );
                                             })),
