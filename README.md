@@ -29,7 +29,7 @@ flowchart LR
     Controller --> Client["corbit-client"]
     Client -->|"HTTP + WebSocket"| Daemon["corbit-daemon"]
     Daemon --> Providers["Codex / Claude / ACP"]
-    Daemon --> Plugins["内置 / 本地第三方插件"]
+    Daemon --> Plugins["Codex 格式插件 / marketplace"]
     Client --> Cache["非权威界面缓存"]
 ```
 
@@ -78,28 +78,18 @@ Corbit App 负责桌面交互、窗口和本地展示状态。Agent 生命周期
 13. 通过 `agent.interrupt` 中断当前活动 Turn，已实现。
 14. 断线后携带最后已提交游标重连；Daemon 要求重置时清空本地事件状态并重放权威
     时间线，已实现。
-15. 通过 `plugin.*` RPC 查看内置市场、安装本地插件目录或 `.corbit-plugin` 包、启停/卸载
-    插件并运行其命令；配置可信 HTTPS 市场后可安装通过索引签名、发布者签名、SHA-256
-    和完整 Manifest 校验的插件。显式声明 JSONL 入口的插件还可在当前工作区内使用
-    受权限约束的目录列表、UTF-8 文件读取、Git 状态、单文件 Diff 和受控文本写入
-    capability；设置页会
-    展示已安装插件、市场条目的权限范围、当前 Daemon 尚未提供能力宿主的权限，以及最近
-    的脱敏执行记录。声明工作区写入权限的命令必须由本机桌面端再次点击确认，授权绑定
-    当前选中的工作区且仅对本次命令有效；命令完成提示会显示不含
-    路径或内容的能力调用次数摘要，已实现。审计记录由 Daemon 持久化在
-    `$CORBIT_HOME/state/plugin-audit.json`，最多 200 条，仅本机根凭证可读；桌面端对旧
-    Daemon 缺少 `plugin.audit.list` 时降级为空记录。记录只展示插件/命令 ID、时间、状态、
-    稳定错误码和能力计数，不包含参数、路径、源码、文件内容、Diff 或错误消息。审计写入
-    失败不会影响插件命令本身，且该记录不是完整操作系统沙箱。已验签且未过期的市场索引
-    会由 Daemon 私有缓存，重启或临时断网仍可展示可信条目；缓存会绑定市场地址并在恢复时
-    重新验证签名。签名市场存在更高 SemVer
-    版本时会展示当前/目标版本并允许更新；更新保持原启用状态，拒绝降级、发布者变更和
-    内置插件覆盖，新增权限必须在设置页二次确认。本地插件先由 Daemon 完整预检，设置页
-    展示名称、ID、发布者、版本、权限、命令、来源类型和指纹摘要；预检会区分新装与更新，
-    更新时显示当前版本、目标版本和新增权限；确认后仅使用五分钟
-    有效的一次性预检令牌安装。Daemon 会再次比对整包指纹，源文件变化、令牌过期或重复
-    使用都会拒绝，且预检响应不包含源绝对路径。能力宿主状态由 Daemon 在市场、预检和
-    已安装插件响应中统一返回；旧 Daemon 缺少该字段时桌面端按空列表兼容。
+15. 通过 `plugin.*` RPC 管理 Codex 格式插件。桌面端只允许选择包含
+    `.codex-plugin/plugin.json` 的目录，不再接收旧 Corbit 清单或压缩包；安装前使用五分钟
+    有效的一次性预检令牌，并展示名称、版本、作者、目录指纹、Skills、MCP、Hooks、Apps
+    以及 Codex/Claude/ACP 兼容性。插件市场读取官方 `.agents/plugins/marketplace.json`
+    结构，支持 local、Git、Git 子目录和 NPM source。启用插件后，Daemon 将 Skills/MCP
+    分别适配并注入 Codex App Server、Claude Agent SDK 和 ACP；Hooks 与 Apps 当前仅展示，
+    尚未由 Corbit 托管。安装、更新、启停与卸载均已实现。插件页还会在
+    `server_info.features.officialPlugins` 可用时读取 Codex App Server 的账号感知官方目录，
+    支持搜索、精选/已安装/市场分组、安装、卸载和安装后的“连接账号”入口。官方连接器
+    只用于 Codex Provider；OAuth 页面由 Codex 提供，Corbit 不保存第三方 OAuth 凭据。
+    OpenAI 当前仍将 App Server 的 `plugin/list`、`plugin/install` 和 `plugin/uninstall`
+    标记为开发中，因此该区域按实验性能力展示，失败不会影响本地插件管理。
 
 协议由 `corbit-daemon` 工程维护。桌面端不得自行增加仅有 Rust 能理解的线协议字段。
 
@@ -128,7 +118,7 @@ corbit-app/
 │               ├── discovery.rs    # 全局搜索与活动中心
 │               ├── event_batch.rs  # 高频时间线增量的有界帧批处理
 │               ├── provider_selection.rs # 按 Agent/Provider 隔离并恢复模型与推理选择
-│               ├── plugins.rs      # 插件市场、本地安装、启停、卸载和命令运行
+│               ├── plugins.rs      # Codex 插件市场、预检、启停与 Provider 兼容性
 │               ├── resources.rs    # Project / Workspace / Agent 管理
 │               ├── settings.rs     # 连接、Provider、快捷键、设备和关于设置
 │               ├── tasks.rs        # 新建任务、任务总览和状态筛选
@@ -150,17 +140,18 @@ GPUI Views -> Controllers -> corbit-client -> corbit-protocol
 
 ## 品牌与图标
 
-Corbit 标志采用扁平化的“三向连接”概念：三个圆角连接件围绕留白核心，表示桌面端、
-移动端和 Agent 通过 Corbit Daemon 协作。图形不包含字母、文字、渐变、阴影或装饰色，
-只使用纯黑 `#0A0A0A` 与纯白 `#FFFFFF`，保证 Dock 与界面小尺寸下仍保持一致轮廓。
+Corbit 标志采用扁平化的“Orbit Weave”概念：一条连续的六向圆角轨道围绕开放核心，
+表示桌面端、移动端和 Agent 通过 Corbit Daemon 持续协作。图形不包含字母、文字、
+渐变、阴影或装饰色，只使用近黑 `#111113` 与暖白 `#F7F7F5`，保证 Dock、菜单栏与
+界面小尺寸下仍保持一致轮廓。
 
 - `corbit-symbol-light.svg` 和 `corbit-symbol-dark.svg` 由 GPUI `BrandAssets` 编译进程序；
   `brand_mark` 根据当前主题自动选择，不依赖运行目录中的外部文件。
-- `corbit-mark.svg` 是白底黑标的通用品牌标志。
+- `corbit-mark.svg` 是暖白底近黑标的通用品牌标志。
 - `corbit-app-icon.svg` 与 `corbit-app-icon-dark.svg` 是白底和黑底两套 Dock 图标母版；
   使用 macOS 标准安全边距和透明圆角画布。当前应用包默认使用白底版 `corbit.icns`，
   同时导出黑底版 `corbit-dark.icns`。
-- `Corbit.icon` 是 Apple Icon Composer 的扁平分层源工程（background、tri-link、open core）。
+- `Corbit.icon` 是 Apple Icon Composer 的扁平分层源工程（background、orbit weave）。
 - `corbit-brand-preview.svg` / PNG 是应用图标与浅色/深色 Logo 的对比稿。
 - `corbit.icns`、`corbit.ico` 和 PNG 是由 SVG 母版生成的打包资产；正式打包流水线
   建立后应直接引用这些文件，不再维护另一份图形。
@@ -261,7 +252,7 @@ bash scripts/generate_brand_assets.sh
 | 权限批准/拒绝     | 已完成实时闭环           | 仅展示 Daemon 推送的可用决定，由 Daemon 最终裁决        |
 | Turn 中断         | 已完成实时闭环           | 仅活动 Turn 可中断，完成状态由时间线事件确认            |
 | 设置与设备配对    | 已完成真实 HTTP 闭环      | Codex 风格设置、连接配置、macOS 钥匙串、配对与设备撤销  |
-| 插件管理与运行    | 已完成预检、更新与审计闭环 | 一次性令牌确认安装、可信更新、权限升级确认、启停/卸载、受控命令、读写能力和脱敏审计记录 |
+| Codex 插件管理    | 已完成统一格式与 Provider 注入 | 一次性令牌预检、市场安装/更新、启停/卸载、Skills/MCP 注入和兼容性展示 |
 | 导航快捷键        | 已完成                   | 新建、搜索、任务、活动和设置全局切换                    |
 | 左侧栏可调宽度    | 已完成                   | 默认对齐 Codex，右边缘可拖拽并跨启动恢复                |
 | 工作区可调分栏    | 已完成                   | Files/Changes 列表与预览宽度可拖拽并跨启动恢复          |
@@ -437,7 +428,7 @@ Cargo 缓存不可写，可为本次任务设置独立的 `CARGO_HOME`，不要�
 - [x] 增加 Codex 风格新建任务、任务总览、全局审批和独立双栏设置界面。
 - [x] 增加移动端一次性配对链接、配对设备列表和凭证撤销界面。
 - [x] 兼容配对响应中的可选 TLS 证书 SHA-256 指纹，由 Flutter 移动端执行证书固定。
-- [x] 增加内置插件市场、本地第三方插件安装/管理和受控命令调用。
+- [x] 统一使用 Codex 插件与 marketplace 标准，并向 Codex、Claude、ACP 注入 Skills/MCP。
 - [x] 增加 Endpoint 持久化、启动自动连接和 macOS 钥匙串 Token 管理。
 - [x] 增加 Files/Changes 可调分栏并持久化面板宽度。
 - [ ] 增加分栏和多窗口。

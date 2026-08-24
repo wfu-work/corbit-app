@@ -62,18 +62,26 @@ const EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
         )),
     ),
     embedded_icon!("activity"),
+    embedded_icon!("arrow-down"),
     embedded_icon!("arrow-left"),
     embedded_icon!("arrow-up"),
+    embedded_icon!("anchor"),
+    embedded_icon!("bell"),
     embedded_icon!("blocks"),
     embedded_icon!("bot"),
+    embedded_icon!("check"),
+    embedded_icon!("chevron-down"),
     embedded_icon!("chevron-right"),
     embedded_icon!("circle-check"),
+    embedded_icon!("clock-3"),
     embedded_icon!("copy"),
     embedded_icon!("external-link"),
     embedded_icon!("file"),
     embedded_icon!("folder-closed"),
     embedded_icon!("folder-open"),
     embedded_icon!("git-compare-arrows"),
+    embedded_icon!("git-branch"),
+    embedded_icon!("globe"),
     embedded_icon!("info"),
     embedded_icon!("keyboard"),
     embedded_icon!("list-todo"),
@@ -115,6 +123,7 @@ pub(crate) enum AppIcon {
     Changes,
     ChevronRight,
     Close,
+    ComputerControl,
     Conversation,
     Copy,
     Delete,
@@ -123,8 +132,11 @@ pub(crate) enum AppIcon {
     File,
     Folder,
     FolderOpen,
+    Git,
+    Hook,
     Info,
     More,
+    Notification,
     PanelLeftClose,
     PanelLeftOpen,
     Play,
@@ -134,6 +146,9 @@ pub(crate) enum AppIcon {
     Refresh,
     Search,
     Send,
+    Snapshot,
+    ScrollToLatest,
+    Scheduled,
     Settings,
     Shortcuts,
     Stop,
@@ -144,6 +159,7 @@ pub(crate) enum AppIcon {
     ToolCall,
     User,
     Workspace,
+    SshConnection,
 }
 
 impl AppIcon {
@@ -158,6 +174,7 @@ impl AppIcon {
         Self::Changes,
         Self::ChevronRight,
         Self::Close,
+        Self::ComputerControl,
         Self::Conversation,
         Self::Copy,
         Self::Delete,
@@ -166,8 +183,11 @@ impl AppIcon {
         Self::File,
         Self::Folder,
         Self::FolderOpen,
+        Self::Git,
+        Self::Hook,
         Self::Info,
         Self::More,
+        Self::Notification,
         Self::PanelLeftClose,
         Self::PanelLeftOpen,
         Self::Play,
@@ -177,6 +197,9 @@ impl AppIcon {
         Self::Refresh,
         Self::Search,
         Self::Send,
+        Self::Snapshot,
+        Self::ScrollToLatest,
+        Self::Scheduled,
         Self::Settings,
         Self::Shortcuts,
         Self::Stop,
@@ -187,6 +210,7 @@ impl AppIcon {
         Self::ToolCall,
         Self::User,
         Self::Workspace,
+        Self::SshConnection,
     ];
 
     const fn asset_path(self) -> &'static str {
@@ -200,6 +224,7 @@ impl AppIcon {
             Self::Changes => "icons/git-compare-arrows.svg",
             Self::ChevronRight => "icons/chevron-right.svg",
             Self::Close => "icons/x.svg",
+            Self::ComputerControl | Self::ToolCall => "icons/workflow.svg",
             Self::Conversation => "icons/message-square.svg",
             Self::Copy => "icons/copy.svg",
             Self::Delete => "icons/trash-2.svg",
@@ -208,8 +233,11 @@ impl AppIcon {
             Self::File => "icons/file.svg",
             Self::Folder | Self::Project => "icons/folder-closed.svg",
             Self::FolderOpen => "icons/folder-open.svg",
+            Self::Git => "icons/git-branch.svg",
+            Self::Hook => "icons/anchor.svg",
             Self::Info => "icons/info.svg",
             Self::More => "icons/more-horizontal.svg",
+            Self::Notification => "icons/bell.svg",
             Self::PanelLeftClose => "icons/panel-left-close.svg",
             Self::PanelLeftOpen => "icons/panel-left-open.svg",
             Self::Play => "icons/play.svg",
@@ -218,6 +246,9 @@ impl AppIcon {
             Self::Refresh => "icons/refresh-cw.svg",
             Self::Search => "icons/search.svg",
             Self::Send => "icons/arrow-up.svg",
+            Self::Snapshot | Self::Workspace => "icons/panels-top-left.svg",
+            Self::ScrollToLatest => "icons/arrow-down.svg",
+            Self::Scheduled => "icons/clock-3.svg",
             Self::Settings => "icons/settings.svg",
             Self::Shortcuts => "icons/keyboard.svg",
             Self::Stop => "icons/square.svg",
@@ -225,9 +256,8 @@ impl AppIcon {
             Self::Tasks => "icons/list-todo.svg",
             Self::Terminal => "icons/square-terminal.svg",
             Self::Tool => "icons/wrench.svg",
-            Self::ToolCall => "icons/workflow.svg",
             Self::User => "icons/user.svg",
-            Self::Workspace => "icons/panels-top-left.svg",
+            Self::SshConnection => "icons/globe.svg",
         }
     }
 }
@@ -350,15 +380,33 @@ mod tests {
                 .unwrap_or_else(|| panic!("{path} should be embedded"));
             let svg = std::str::from_utf8(&bytes).expect("icon should be valid UTF-8 SVG");
 
-            for expected in [
-                "viewBox=\"0 0 24 24\"",
-                "fill=\"none\"",
-                "stroke=\"currentColor\"",
-                "stroke-width=\"2\"",
-                "stroke-linecap=\"round\"",
-                "stroke-linejoin=\"round\"",
-            ] {
+            for expected in ["viewBox=\"0 0 24 24\"", "currentColor"] {
                 assert!(svg.contains(expected), "{path} should contain {expected}");
+            }
+            if path == "icons/square.svg" {
+                assert!(
+                    svg.contains("fill=\"currentColor\""),
+                    "{path} should be a filled stop glyph"
+                );
+            } else {
+                for expected in [
+                    "fill=\"none\"",
+                    "stroke=\"currentColor\"",
+                    "stroke-linecap=\"round\"",
+                    "stroke-linejoin=\"round\"",
+                ] {
+                    assert!(svg.contains(expected), "{path} should contain {expected}");
+                }
+                let stroke_width = if matches!(path, "icons/arrow-down.svg" | "icons/arrow-up.svg")
+                {
+                    "stroke-width=\"1.75\""
+                } else {
+                    "stroke-width=\"2\""
+                };
+                assert!(
+                    svg.contains(stroke_width),
+                    "{path} should contain {stroke_width}"
+                );
             }
         }
     }
@@ -384,6 +432,22 @@ mod tests {
             let svg = std::str::from_utf8(&bytes).expect("provider mark should be UTF-8 SVG");
             assert!(svg.contains("viewBox=\"0 0 24 24\""));
             assert!(svg.contains("fill=\"currentColor\""));
+        }
+    }
+
+    #[test]
+    fn embedded_component_icons_are_available_to_gpui() {
+        let assets = BrandAssets;
+
+        for path in ["icons/check.svg", "icons/chevron-down.svg"] {
+            let bytes = assets
+                .load(path)
+                .expect("component icon asset lookup should succeed")
+                .unwrap_or_else(|| panic!("{path} should be embedded"));
+            let svg = std::str::from_utf8(&bytes).expect("component icon should be valid SVG");
+
+            assert!(svg.contains("viewBox=\"0 0 24 24\""));
+            assert!(svg.contains("stroke=\"currentColor\""));
         }
     }
 }

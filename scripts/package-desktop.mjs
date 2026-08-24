@@ -61,6 +61,8 @@ function infoPlist(version, appName, bundleIdentifier) {
   <string>${escapedVersion}</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Corbit 使用系统事件检查辅助功能状态，并仅在你允许的应用中执行受控操作。</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>

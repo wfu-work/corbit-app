@@ -1,17 +1,23 @@
 mod appearance;
 mod branding;
 mod build_info;
+mod coding;
 mod connection;
+mod desktop_notifications;
 mod discovery;
 mod event_batch;
 mod feedback;
+mod integrations;
 mod local_daemon;
 mod plugins;
 mod provider;
 mod provider_catalog;
 mod provider_selection;
 mod resources;
+mod scheduled;
 mod settings;
+mod settings_components;
+mod sleep_prevention;
 #[cfg(target_os = "macos")]
 mod system_tray;
 mod tasks;
@@ -25,15 +31,22 @@ use appearance::{
     InterfaceFont, InterfaceTextSize,
 };
 use branding::{AppIcon, BrandAssets, brand_mark};
+use coding::{CodingPreferences, SshConnectionTestState, detect_git_version};
 use connection::{ConnectionPreferences, CredentialSource};
 use discovery::{ActivityFilter, SearchScope};
 use feedback::{FeedbackKind, push_app_notification};
+use integrations::{IntegrationPreferences, IntegrationProbeState};
 use provider::{
-    PROVIDERS, ProviderBadgeSize, ProviderInfo, provider_badge, provider_label,
-    provider_supports_turn_options, reasoning_effort_label, reasoning_effort_short_label,
+    PROVIDERS, ProviderBadgeSize, ProviderInfo, model_display_name, provider_badge, provider_label,
+    provider_supports_turn_options, reasoning_effort_short_label,
 };
 use provider_selection::ComposerSelections;
-use resources::{DeleteTarget, RetryMutation};
+use resources::{AgentMenuData, DeleteTarget, RetryMutation};
+use settings_components::{
+    SettingsCard, settings_action_button, settings_card, settings_danger_action_button,
+    settings_input, settings_primary_action_button, settings_quiet_action_button,
+    settings_select_button, settings_select_menu, settings_switch,
+};
 use tasks::{PendingNewTaskRecovery, TaskFilter};
 use theme::{
     COLOR_BORDER, COLOR_BORDER_HEAVY, COLOR_BORDER_LIGHT, COLOR_EDITOR, COLOR_ERROR, COLOR_SUCCESS,
@@ -42,14 +55,18 @@ use theme::{
     FONT_SIZE_SM, FONT_SIZE_XS, FONT_WEIGHT_BASE, PANE_TOOLBAR_HEIGHT, SIDEBAR_FONT_SIZE,
     SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, TITLEBAR_LEFT_PADDING, TOOLBAR_HEIGHT, blend_hex,
     configure_codex_theme, content_max_width, fixed_rgb, font_px, interface_font_family,
-    mono_font_family, navigation_row_height, rgb, shell_background, sidebar_border_rgb,
-    sidebar_rgb, sidebar_row_active_rgb, sidebar_row_hover_rgb, theme_color_hex,
+    is_dark_mode, mono_font_family, navigation_row_height, rgb, shell_background,
+    sidebar_border_rgb, sidebar_rgb, sidebar_row_active_rgb, sidebar_row_hover_rgb,
+    theme_color_hex,
 };
 use timeline::{
-    ComposerAttachment, ConversationIndexInteraction, PendingPermission, RetryControl, RetryPrompt,
-    TimelineIndex, TimelineStatus, TimelineTurn,
+    ComposerAttachment, ConversationIndexInteraction, PendingPermission, QueuedPrompt,
+    RetryControl, RetryPrompt, TimelineIndex, TimelineStatus, TimelineTurn,
 };
-use ui_state::{PanelWidths, UiPreferences, WindowPlacement};
+use ui_state::{
+    AgentConfigurationPreferences, CloseWindowBehavior, FollowUpBehavior, GeneralPreferences,
+    PanelWidths, PromptSubmitBehavior, StartupDestination, UiPreferences, WindowPlacement,
+};
 use workspace::{
     FileOperationState, FileOperationTarget, GitOperationState, WorkspaceRefreshQueue,
 };
@@ -58,11 +75,11 @@ use gpui::{
     Animation, AnimationExt, AnyElement, App, AppContext, Application, ClipboardItem, Context,
     Corner, Div, Entity, FontWeight, IntoElement, KeyBinding, ListAlignment, ListState,
     PathPromptOptions, Render, SharedString, Subscription, Task, Timer, Window,
-    WindowBackgroundAppearance, WindowOptions, canvas, div, list, percentage, prelude::*, px, rems,
-    rgb as gpui_rgb,
+    WindowBackgroundAppearance, WindowOptions, canvas, div, img, list, percentage, prelude::*, px,
+    rems, rgb as gpui_rgb,
 };
 use gpui_component::{
-    Disableable, Icon, PixelsExt, Root, Selectable, Sizable, StyledExt, WindowExt,
+    Disableable, Icon, PixelsExt, Root, Selectable, Sizable, Size, StyledExt, WindowExt,
     button::{Button, ButtonCustomVariant, ButtonVariant, ButtonVariants},
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     dialog::DialogButtonProps,
@@ -71,14 +88,13 @@ use gpui_component::{
     plot::shape::{Arc, ArcData},
     resizable::{h_resizable, resizable_panel},
     scroll::ScrollableElement,
-    switch::Switch,
     text::{TextView, TextViewStyle},
     tooltip::Tooltip,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     process::Command,
     time::Duration,
@@ -90,10 +106,15 @@ gpui::actions!(
         OpenNewTask,
         OpenSearch,
         OpenTasks,
+        OpenScheduled,
         OpenActivity,
-        OpenSettings
+        OpenSettings,
+        CaptureAppSnapshot,
+        SubmitPrompt
     ]
 );
+
+const CONVERSATION_TITLE_MAX_WIDTH: f32 = 420.;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,6 +122,7 @@ enum MainSection {
     NewTask,
     Search,
     Tasks,
+    Scheduled,
     Activity,
     Permissions,
     Conversation,
@@ -114,14 +136,26 @@ enum MainSection {
 enum ResourceSection {
     General,
     Appearance,
+    Notifications,
+    Configuration,
     Providers,
+    ComputerControl,
+    AppSnapshot,
     Plugins,
+    Browser,
     Shortcuts,
     Projects,
+    SshConnections,
+    Git,
+    Hooks,
+    #[serde(rename = "workspaces")]
     Workspaces,
+    #[serde(rename = "agents")]
     Agents,
+    Daemon,
     Devices,
     About,
+    ThirdPartyLicenses,
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -146,15 +180,29 @@ struct ConnectionView {
     provider_catalog_request_id: u64,
     plugins: Vec<corbit_client::PluginRecord>,
     plugin_marketplace: Vec<corbit_client::PluginMarketplaceEntry>,
-    plugin_audit: Vec<corbit_client::PluginAuditEntry>,
+    codex_official_plugin_catalog: Option<corbit_client::CodexOfficialPluginCatalog>,
+    codex_official_plugin_error: Option<String>,
+    codex_official_plugin_search: Entity<InputState>,
+    codex_official_apps_needing_auth: Vec<corbit_client::CodexOfficialPluginApp>,
+    pending_codex_official_plugin_install: Option<String>,
+    pending_codex_official_plugin_uninstall: Option<String>,
     pending_plugin_uninstall: Option<String>,
     pending_plugin_update: Option<String>,
-    pending_plugin_write: Option<String>,
     pending_plugin_inspection: Option<corbit_client::PluginInspection>,
     main_section: MainSection,
     sidebar_collapsed: bool,
     settings_return_section: MainSection,
     resource_section: ResourceSection,
+    general_preferences: GeneralPreferences,
+    agent_configuration: AgentConfigurationPreferences,
+    coding_preferences: CodingPreferences,
+    integration_preferences: IntegrationPreferences,
+    computer_access_status: IntegrationProbeState,
+    browser_connection_status: IntegrationProbeState,
+    snapshot_capture_status: IntegrationProbeState,
+    computer_allowed_application: Entity<InputState>,
+    browser_connector_endpoint: Entity<InputState>,
+    browser_allowed_domain: Entity<InputState>,
     appearance: AppearancePreferences,
     appearance_error: Option<String>,
     appearance_theme_code: Entity<InputState>,
@@ -174,12 +222,41 @@ struct ConnectionView {
     workspace_name: Entity<InputState>,
     workspace_directory: Entity<InputState>,
     workspace_new_name: Entity<InputState>,
+    ssh_connection_name: Entity<InputState>,
+    ssh_connection_host: Entity<InputState>,
+    ssh_connection_user: Entity<InputState>,
+    ssh_connection_port: Entity<InputState>,
+    ssh_connection_identity_file: Entity<InputState>,
+    ssh_connection_tests: BTreeMap<String, SshConnectionTestState>,
+    pending_ssh_connection_delete: Option<String>,
+    git_branch_prefix: Entity<InputState>,
+    git_monitoring_instructions: Entity<InputState>,
+    git_commit_instructions: Entity<InputState>,
+    git_version: Option<String>,
     selected_provider: String,
     project_providers: BTreeMap<String, String>,
     search_input: Entity<InputState>,
     search_scope: SearchScope,
     activity_filter: ActivityFilter,
     task_filter: TaskFilter,
+    scheduled_filter: scheduled::ScheduledFilter,
+    scheduled_tasks: Vec<corbit_client::ScheduledTask>,
+    scheduled_runs: Vec<corbit_client::ScheduledRun>,
+    scheduled_search: Entity<InputState>,
+    scheduled_title: Entity<InputState>,
+    scheduled_prompt: Entity<InputState>,
+    scheduled_interval: Entity<InputState>,
+    scheduled_time: Entity<InputState>,
+    scheduled_agent_id: Option<String>,
+    scheduled_cadence: scheduled::ScheduledCadence,
+    scheduled_weekday: u8,
+    scheduled_permission_mode: corbit_client::AgentPermissionMode,
+    scheduled_editor_open: bool,
+    scheduled_editing_task_id: Option<String>,
+    scheduled_delete_confirmation: Option<String>,
+    scheduled_expanded_runs: BTreeSet<String>,
+    scheduled_operation_in_flight: bool,
+    scheduled_request_id: u64,
     agent_title: Entity<InputState>,
     agent_new_title: Entity<InputState>,
     new_task_prompt: Entity<InputState>,
@@ -190,12 +267,14 @@ struct ConnectionView {
     composer_selections: ComposerSelections,
     composer_permission_mode: corbit_client::AgentPermissionMode,
     prompt_attachments: Vec<ComposerAttachment>,
+    queued_prompts: VecDeque<QueuedPrompt>,
     attachment_in_flight: bool,
     new_task_clear_requested: bool,
     new_task_recovery: Option<PendingNewTaskRecovery>,
     new_task_cleanup_armed: bool,
     timeline_list_state: ListState,
     timeline_list_agent_id: Option<String>,
+    timeline_follow_pending: bool,
     conversation_index_interaction: ConversationIndexInteraction,
     panel_widths: PanelWidths,
     window_placement: Option<WindowPlacement>,
@@ -210,6 +289,7 @@ struct ConnectionView {
     timeline_dirty_turns: BTreeSet<(String, String)>,
     expanded_timeline_steps: BTreeSet<String>,
     expanded_timeline_activity: BTreeSet<String>,
+    collapsed_streaming_timeline_activity: BTreeSet<String>,
     permissions: Vec<PendingPermission>,
     workspace_listing: Option<corbit_client::WorkspaceDirectoryListing>,
     workspace_file: Option<corbit_client::WorkspaceFileContent>,
@@ -223,6 +303,7 @@ struct ConnectionView {
     control_in_flight: bool,
     provider_switch_in_flight: bool,
     plugin_operation_in_flight: bool,
+    codex_official_plugin_operation_in_flight: bool,
     file_operation_state: FileOperationState,
     file_operation_target: Option<FileOperationTarget>,
     git_operation_state: GitOperationState,
@@ -241,12 +322,20 @@ struct ConnectionView {
     provider_catalog_refresh_task: Option<Task<()>>,
     provider_switch_task: Option<Task<()>>,
     plugin_task: Option<Task<()>>,
+    codex_official_plugin_task: Option<Task<()>>,
+    computer_access_task: Option<Task<()>>,
+    browser_connection_task: Option<Task<()>>,
+    app_snapshot_task: Option<Task<()>>,
     file_task: Option<Task<()>>,
     git_task: Option<Task<()>>,
+    ssh_connection_task: Option<Task<()>>,
     new_task_task: Option<Task<()>>,
+    scheduled_task: Option<Task<()>>,
+    scheduled_refresh_task: Option<Task<()>>,
     device_task: Option<Task<()>>,
     ui_save_task: Option<Task<()>>,
     _timeline_clock_task: Option<Task<()>>,
+    sleep_preventer: Option<sleep_prevention::SleepPreventer>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -259,8 +348,12 @@ impl ConnectionView {
         ui_preferences: UiPreferences,
     ) -> Self {
         let UiPreferences {
+            general,
+            agent_configuration,
+            coding,
+            integrations,
             sidebar_collapsed,
-            main_section,
+            main_section: restored_main_section,
             settings_return_section,
             resource_section,
             selected_project_id,
@@ -269,6 +362,7 @@ impl ConnectionView {
             selected_provider,
             project_providers,
             composer_selections,
+            composer_permission_mode,
             task_filter,
             new_task_draft,
             prompt_drafts,
@@ -276,6 +370,16 @@ impl ConnectionView {
             panel_widths,
             window: window_placement,
         } = ui_preferences;
+        let git_branch_prefix_value = coding.git.branch_prefix.clone();
+        let git_monitoring_instructions_value = coding.git.monitoring_instructions.clone();
+        let git_commit_instructions_value = coding.git.commit_instructions.clone();
+        let browser_connector_endpoint_value = integrations.browser.connector_endpoint.clone();
+        let main_section = general.startup_destination.resolve(restored_main_section);
+        let (new_task_draft, prompt_drafts) = if general.save_prompt_drafts {
+            (new_task_draft, prompt_drafts)
+        } else {
+            (String::new(), BTreeMap::new())
+        };
         let connection_preferences = ConnectionPreferences::load();
         let resolved_endpoint = connection_preferences.resolved_endpoint();
         let daemon_endpoint = resolved_endpoint.value;
@@ -299,6 +403,10 @@ impl ConnectionView {
             .unwrap_or_default();
         let search_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索任务、工作区或项目…"));
+        let codex_official_plugin_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索 Codex 官方插件…"));
+        let scheduled_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("搜索已安排任务…"));
         let new_task_prompt = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("描述你希望 Corbit 完成的任务")
@@ -336,18 +444,39 @@ impl ConnectionView {
                     }
                 }),
             ];
-        subscriptions.push(
-            cx.subscribe(&new_task_prompt, |view, _, event: &InputEvent, cx| {
-                if matches!(
-                    event,
-                    InputEvent::Change | InputEvent::PressEnter { secondary: true }
-                ) {
-                    view.schedule_ui_state_save(cx);
+        subscriptions.push(cx.subscribe(
+            &scheduled_search,
+            |_: &mut Self, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
                     cx.notify();
-                } else if matches!(event, InputEvent::PressEnter { secondary: true }) {
-                    view.create_new_task(cx);
                 }
-            }),
+            },
+        ));
+        subscriptions.push(cx.subscribe(
+            &codex_official_plugin_search,
+            |_: &mut Self, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        ));
+        subscriptions.push(
+            cx.subscribe(
+                &new_task_prompt,
+                |view, _, event: &InputEvent, cx| match event {
+                    InputEvent::PressEnter { secondary: false }
+                        if view.general_preferences.prompt_submit_behavior
+                            == PromptSubmitBehavior::Enter =>
+                    {
+                        view.create_new_task(cx);
+                    }
+                    InputEvent::Change | InputEvent::PressEnter { .. } => {
+                        view.schedule_ui_state_save(cx);
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
         );
         subscriptions.push(cx.subscribe_in(
             &prompt_input,
@@ -366,15 +495,26 @@ impl ConnectionView {
                     cx.notify();
                 }
                 InputEvent::PressEnter { secondary: false } => {
-                    let value_with_enter = input.read(cx).value().to_string();
-                    let value_before_enter = value_with_enter
-                        .strip_suffix('\n')
-                        .unwrap_or(&value_with_enter)
-                        .to_string();
-                    input.update(cx, |input, cx| {
-                        input.set_value(value_before_enter, window, cx);
-                    });
-                    view.send_prompt(cx);
+                    if view.general_preferences.prompt_submit_behavior
+                        == PromptSubmitBehavior::Enter
+                    {
+                        let value_with_enter = input.read(cx).value().to_string();
+                        let value_before_enter = value_with_enter
+                            .strip_suffix('\n')
+                            .unwrap_or(&value_with_enter)
+                            .to_string();
+                        input.update(cx, |input, cx| {
+                            input.set_value(value_before_enter, window, cx);
+                        });
+                        view.send_prompt(cx);
+                    } else {
+                        if let Some(agent_id) = view.prompt_input_agent_id.clone() {
+                            view.prompt_drafts
+                                .insert(agent_id, input.read(cx).value().to_string());
+                        }
+                        view.schedule_ui_state_save(cx);
+                        cx.notify();
+                    }
                 }
                 _ => {}
             },
@@ -482,15 +622,33 @@ impl ConnectionView {
             provider_catalog_request_id: 0,
             plugins: Vec::new(),
             plugin_marketplace: Vec::new(),
-            plugin_audit: Vec::new(),
+            codex_official_plugin_catalog: None,
+            codex_official_plugin_error: None,
+            codex_official_plugin_search,
+            codex_official_apps_needing_auth: Vec::new(),
+            pending_codex_official_plugin_install: None,
+            pending_codex_official_plugin_uninstall: None,
             pending_plugin_uninstall: None,
             pending_plugin_update: None,
-            pending_plugin_write: None,
             pending_plugin_inspection: None,
             main_section,
             sidebar_collapsed,
             settings_return_section,
             resource_section,
+            general_preferences: general,
+            agent_configuration,
+            coding_preferences: coding,
+            integration_preferences: integrations,
+            computer_access_status: IntegrationProbeState::NotChecked,
+            browser_connection_status: IntegrationProbeState::NotChecked,
+            snapshot_capture_status: IntegrationProbeState::NotChecked,
+            computer_allowed_application: input_state("例如：Xcode", window, cx),
+            browser_connector_endpoint: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("http://127.0.0.1:9222")
+                    .default_value(browser_connector_endpoint_value)
+            }),
+            browser_allowed_domain: input_state("例如：github.com 或 *.example.com", window, cx),
             appearance,
             appearance_error: None,
             appearance_theme_code,
@@ -510,12 +668,71 @@ impl ConnectionView {
             workspace_name: input_state("工作区名称", window, cx),
             workspace_directory: input_state("工作区绝对工作目录", window, cx),
             workspace_new_name: input_state("工作区新名称", window, cx),
+            ssh_connection_name: input_state("例如：开发服务器", window, cx),
+            ssh_connection_host: input_state("主机名、IP 或 SSH Host 别名", window, cx),
+            ssh_connection_user: input_state("可选用户名", window, cx),
+            ssh_connection_port: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("22")
+                    .default_value("22")
+            }),
+            ssh_connection_identity_file: input_state("可选身份文件路径", window, cx),
+            ssh_connection_tests: BTreeMap::new(),
+            pending_ssh_connection_delete: None,
+            git_branch_prefix: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("corbit/")
+                    .default_value(git_branch_prefix_value)
+            }),
+            git_monitoring_instructions: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("例如：检查通过后再合并，并忽略不相关的变更…")
+                    .default_value(git_monitoring_instructions_value)
+                    .auto_grow(3, 8)
+            }),
+            git_commit_instructions: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("添加提交信息指引…")
+                    .default_value(git_commit_instructions_value)
+                    .auto_grow(3, 8)
+            }),
+            git_version: detect_git_version(),
             selected_provider,
             project_providers,
             search_input,
             search_scope: SearchScope::All,
             activity_filter: ActivityFilter::All,
             task_filter,
+            scheduled_filter: scheduled::ScheduledFilter::All,
+            scheduled_tasks: Vec::new(),
+            scheduled_runs: Vec::new(),
+            scheduled_search,
+            scheduled_title: input_state("计划名称", window, cx),
+            scheduled_prompt: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("描述每次运行要完成的工作…")
+                    .auto_grow(3, 8)
+            }),
+            scheduled_interval: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("分钟")
+                    .default_value("60")
+            }),
+            scheduled_time: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("09:00")
+                    .default_value("09:00")
+            }),
+            scheduled_agent_id: None,
+            scheduled_cadence: scheduled::ScheduledCadence::Daily,
+            scheduled_weekday: 1,
+            scheduled_permission_mode: corbit_client::AgentPermissionMode::ReadOnly,
+            scheduled_editor_open: false,
+            scheduled_editing_task_id: None,
+            scheduled_delete_confirmation: None,
+            scheduled_expanded_runs: BTreeSet::new(),
+            scheduled_operation_in_flight: false,
+            scheduled_request_id: 0,
             agent_title: input_state("Agent 标题", window, cx),
             agent_new_title: input_state("Agent 新标题", window, cx),
             new_task_prompt,
@@ -524,14 +741,16 @@ impl ConnectionView {
             prompt_input_agent_id,
             prompt_clear_agent_id: None,
             composer_selections,
-            composer_permission_mode: corbit_client::AgentPermissionMode::WorkspaceWrite,
+            composer_permission_mode,
             prompt_attachments: Vec::new(),
+            queued_prompts: VecDeque::new(),
             attachment_in_flight: false,
             new_task_clear_requested: false,
             new_task_recovery,
             new_task_cleanup_armed: false,
             timeline_list_state: ListState::new(0, ListAlignment::Bottom, px(600.)),
             timeline_list_agent_id: None,
+            timeline_follow_pending: false,
             conversation_index_interaction: ConversationIndexInteraction::default(),
             panel_widths,
             window_placement,
@@ -554,6 +773,7 @@ impl ConnectionView {
             timeline_dirty_turns: BTreeSet::new(),
             expanded_timeline_steps: BTreeSet::new(),
             expanded_timeline_activity: BTreeSet::new(),
+            collapsed_streaming_timeline_activity: BTreeSet::new(),
             permissions: Vec::new(),
             workspace_listing: None,
             workspace_file: None,
@@ -567,6 +787,7 @@ impl ConnectionView {
             control_in_flight: false,
             provider_switch_in_flight: false,
             plugin_operation_in_flight: false,
+            codex_official_plugin_operation_in_flight: false,
             file_operation_state: FileOperationState::Idle,
             file_operation_target: None,
             git_operation_state: GitOperationState::Idle,
@@ -585,12 +806,20 @@ impl ConnectionView {
             provider_catalog_refresh_task: None,
             provider_switch_task: None,
             plugin_task: None,
+            codex_official_plugin_task: None,
+            computer_access_task: None,
+            browser_connection_task: None,
+            app_snapshot_task: None,
             file_task: None,
             git_task: None,
+            ssh_connection_task: None,
             new_task_task: None,
+            scheduled_task: None,
+            scheduled_refresh_task: None,
             device_task: None,
             ui_save_task: None,
             _timeline_clock_task: Some(timeline_clock_task),
+            sleep_preventer: None,
             _subscriptions: subscriptions,
         };
         cx.defer_in(window, |view, _, cx| view.connect(cx));
@@ -671,9 +900,9 @@ impl ConnectionView {
             let message = credential.error.map_or_else(
                 || {
                     if connection::is_loopback_endpoint(&endpoint) {
-                        "未找到本机 Daemon 凭据；请确认 Daemon 已启动，或在设置 > 常规中手动填写 Token".into()
+                        "未找到本机 Daemon 凭据；请确认 Daemon 已启动，或在设置 > Daemon 中手动填写 Token".into()
                     } else {
-                        "未配置 Daemon Token；请在设置 > 常规中保存凭证".into()
+                        "未配置 Daemon Token；请在设置 > Daemon 中保存凭证".into()
                     }
                 },
                 |error| format!("无法读取 Daemon 凭证：{error}"),
@@ -730,6 +959,15 @@ impl ConnectionView {
                             view.apply_event(event, cx);
                         }
                         view.flush_timeline_list_updates();
+                        if view.timeline_follow_pending {
+                            view.timeline_follow_pending = false;
+                            view.scroll_selected_timeline_to_latest();
+                        }
+                        if let Err(error) = view.sync_sleep_prevention() {
+                            view.general_preferences.prevent_sleep_while_running = false;
+                            view.show_error(error.to_string(), cx);
+                            view.schedule_ui_state_save(cx);
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -753,6 +991,7 @@ impl ConnectionView {
         self.control_in_flight = false;
         self.provider_switch_in_flight = false;
         self.plugin_operation_in_flight = false;
+        self.codex_official_plugin_operation_in_flight = false;
         self.new_task_in_flight = false;
         self.device_operation_in_flight = false;
         self.mutation_task = None;
@@ -763,15 +1002,25 @@ impl ConnectionView {
         self.provider_catalog_refresh_task = None;
         self.provider_switch_task = None;
         self.plugin_task = None;
+        self.codex_official_plugin_task = None;
         self.new_task_task = None;
+        self.scheduled_task = None;
+        self.scheduled_refresh_task = None;
+        self.scheduled_operation_in_flight = false;
+        self.scheduled_request_id = self.scheduled_request_id.wrapping_add(1);
+        self.scheduled_tasks.clear();
+        self.scheduled_runs.clear();
         self.device_task = None;
         self.devices.clear();
         self.plugins.clear();
         self.plugin_marketplace.clear();
-        self.plugin_audit.clear();
+        self.codex_official_plugin_catalog = None;
+        self.codex_official_plugin_error = None;
+        self.codex_official_apps_needing_auth.clear();
+        self.pending_codex_official_plugin_install = None;
+        self.pending_codex_official_plugin_uninstall = None;
         self.pending_plugin_uninstall = None;
         self.pending_plugin_update = None;
-        self.pending_plugin_write = None;
         self.pending_plugin_inspection = None;
         self.pairing_offer = None;
         self.pending_revoke_device_id = None;
@@ -799,7 +1048,7 @@ impl ConnectionView {
             } => format!("连接中断：{reason}；第 {attempt} 次重连将在 {delay_ms}ms 后开始"),
             corbit_client::ConnectionState::AuthenticationFailed => {
                 if self.credential_source == Some(CredentialSource::LocalDaemon) {
-                    "已发现本机 Daemon，但自动读取的凭据被拒绝；如果启动时设置了 CORBIT_AUTH_TOKEN，请在设置 > 常规中手动填写同一 Token".into()
+                    "已发现本机 Daemon，但自动读取的凭据被拒绝；如果启动时设置了 CORBIT_AUTH_TOKEN，请在设置 > Daemon 中手动填写同一 Token".into()
                 } else {
                     "Bearer Token 无效或已被撤销".into()
                 }
@@ -838,7 +1087,7 @@ impl ConnectionView {
             self.state = corbit_client::ConnectionState::Offline;
         }
         if authentication_failed && self.credential_source == Some(CredentialSource::LocalDaemon) {
-            self.show_error("已发现本机 Daemon，但自动读取的凭据被拒绝；如果启动时设置了 CORBIT_AUTH_TOKEN，请在设置 > 常规中手动填写同一 Token", cx);
+            self.show_error("已发现本机 Daemon，但自动读取的凭据被拒绝；如果启动时设置了 CORBIT_AUTH_TOKEN，请在设置 > Daemon 中手动填写同一 Token", cx);
         } else if authentication_failed || incompatible {
             self.show_error(self.detail.clone(), cx);
         } else {
@@ -877,10 +1126,19 @@ impl ConnectionView {
             }
             corbit_client::RuntimeEvent::Connection(
                 corbit_client::ConnectionEvent::AgentTimeline { payload, .. },
-            ) => self.apply_timeline(payload),
+            ) => {
+                let completed = matches!(
+                    &payload.event,
+                    corbit_client::AgentTimelineEvent::TurnCompleted { .. }
+                );
+                self.apply_timeline(payload, cx);
+                if completed && self.main_section == MainSection::Scheduled {
+                    self.schedule_scheduled_refresh(cx);
+                }
+            }
             corbit_client::RuntimeEvent::Connection(
                 corbit_client::ConnectionEvent::AgentPermission { payload, .. },
-            ) => self.apply_permission(payload),
+            ) => self.apply_permission(payload, cx),
             corbit_client::RuntimeEvent::Connection(
                 corbit_client::ConnectionEvent::WorkspaceChanged(change),
             ) => self.apply_workspace_changed(&change, cx),
@@ -890,6 +1148,9 @@ impl ConnectionView {
                 self.reconcile_selection();
                 self.reconcile_new_task_recovery();
                 self.start_provider_catalog_if_ready(cx);
+                if self.main_section == MainSection::Scheduled {
+                    self.load_scheduled_tasks(cx);
+                }
                 self.schedule_ui_state_save(cx);
                 if self.main_section == MainSection::Resources
                     && self.resource_section == ResourceSection::Devices
@@ -897,9 +1158,15 @@ impl ConnectionView {
                     self.load_devices(cx);
                 }
                 if self.main_section == MainSection::Resources
-                    && self.resource_section == ResourceSection::Plugins
+                    && matches!(
+                        self.resource_section,
+                        ResourceSection::Plugins | ResourceSection::Hooks
+                    )
                 {
                     self.load_plugins(cx);
+                    if self.resource_section == ResourceSection::Plugins {
+                        self.load_codex_official_plugins(false, cx);
+                    }
                 }
             }
             corbit_client::RuntimeEvent::Error(message) => {
@@ -913,7 +1180,19 @@ impl ConnectionView {
     }
 
     fn ui_preferences(&self, cx: &App) -> UiPreferences {
+        let (new_task_draft, prompt_drafts) = if self.general_preferences.save_prompt_drafts {
+            (
+                self.new_task_prompt.read(cx).value().to_string(),
+                self.prompt_drafts.clone(),
+            )
+        } else {
+            (String::new(), BTreeMap::new())
+        };
         UiPreferences {
+            general: self.general_preferences,
+            agent_configuration: self.agent_configuration,
+            coding: self.coding_preferences.clone(),
+            integrations: self.integration_preferences.clone(),
             sidebar_collapsed: self.sidebar_collapsed,
             main_section: self.main_section,
             settings_return_section: self.settings_return_section,
@@ -924,9 +1203,10 @@ impl ConnectionView {
             selected_provider: self.selected_provider.clone(),
             project_providers: self.project_providers.clone(),
             composer_selections: self.composer_selections.clone(),
+            composer_permission_mode: self.composer_permission_mode,
             task_filter: self.task_filter,
-            new_task_draft: self.new_task_prompt.read(cx).value().to_string(),
-            prompt_drafts: self.prompt_drafts.clone(),
+            new_task_draft,
+            prompt_drafts,
             new_task_recovery: self.new_task_recovery.clone(),
             panel_widths: self.panel_widths,
             window: self.window_placement,
@@ -1024,6 +1304,11 @@ impl ConnectionView {
             {
                 self.load_workspace_git_status(cx);
             }
+            MainSection::Scheduled => {
+                self.load_scheduled_tasks(cx);
+                self.schedule_ui_state_save(cx);
+                cx.notify();
+            }
             MainSection::NewTask
             | MainSection::Search
             | MainSection::Tasks
@@ -1053,6 +1338,10 @@ impl ConnectionView {
         }
         if section == ResourceSection::Plugins {
             self.load_plugins(cx);
+            self.load_codex_official_plugins(false, cx);
+        }
+        if section == ResourceSection::Hooks {
+            self.load_plugins(cx);
         }
     }
 
@@ -1081,12 +1370,24 @@ impl ConnectionView {
         self.set_main_section(MainSection::Tasks, cx);
     }
 
+    fn open_scheduled(&mut self, _: &OpenScheduled, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_main_section(MainSection::Scheduled, cx);
+    }
+
     fn open_activity(&mut self, _: &OpenActivity, _: &mut Window, cx: &mut Context<Self>) {
         self.set_main_section(MainSection::Activity, cx);
     }
 
     fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
         self.set_main_section(MainSection::Resources, cx);
+    }
+
+    fn submit_prompt_action(&mut self, _: &SubmitPrompt, _: &mut Window, cx: &mut Context<Self>) {
+        match self.main_section {
+            MainSection::NewTask => self.create_new_task(cx),
+            MainSection::Conversation => self.send_prompt(cx),
+            _ => {}
+        }
     }
 
     fn render_section_button(
@@ -1195,11 +1496,30 @@ impl ConnectionView {
             let selected = self.selected_agent_id.as_ref()?;
             snapshot.agents.iter().find(|agent| &agent.id == selected)
         });
+        let conversation_menu_data = self.snapshot.as_ref().and_then(|snapshot| {
+            let agent = selected_agent?;
+            let workspace = snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == agent.workspace_id)?;
+            let project = snapshot
+                .projects
+                .iter()
+                .find(|project| project.id == workspace.project_id)?;
+            Some(AgentMenuData {
+                agent_id: agent.id.clone(),
+                agent_title: agent.title.clone(),
+                working_directory: workspace.working_directory.clone(),
+                project_id: project.id.clone(),
+                workspace_id: workspace.id.clone(),
+            })
+        });
         let title = match self.main_section {
             MainSection::Resources => "设置".to_owned(),
             MainSection::NewTask => "新建任务".to_owned(),
             MainSection::Search => "搜索".to_owned(),
             MainSection::Tasks => "任务".to_owned(),
+            MainSection::Scheduled => "已安排".to_owned(),
             MainSection::Activity => "活动".to_owned(),
             MainSection::Permissions => "审批".to_owned(),
             MainSection::Files => selected_workspace.map_or_else(
@@ -1218,6 +1538,7 @@ impl ConnectionView {
             ),
             MainSection::Search => "跨任务、工作区与项目查找".to_owned(),
             MainSection::Tasks => "所有本机 Agent 会话".to_owned(),
+            MainSection::Scheduled => "在后台按计划运行 Agent 任务".to_owned(),
             MainSection::Activity => "本次连接的运行、完成与待处理事件".to_owned(),
             MainSection::Permissions => format!("{} 个待处理请求", self.permissions.len()),
             _ => match (selected_project, selected_workspace) {
@@ -1228,6 +1549,12 @@ impl ConnectionView {
                 _ => "本机工作区".to_owned(),
             },
         };
+        let is_conversation = self.main_section == MainSection::Conversation;
+        let conversation_title = title.clone();
+        let standard_title = title;
+        let header_view = cx.entity();
+        let can_mutate_agent = matches!(self.state, corbit_client::ConnectionState::Online)
+            && !self.operation_in_flight;
         div()
             .h_flex()
             .w_full()
@@ -1261,22 +1588,69 @@ impl ConnectionView {
                                 })),
                         )
                     })
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(font_px(FONT_SIZE_BASE))
-                            .font_medium()
-                            .truncate()
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_size(font_px(FONT_SIZE_SM))
-                            .text_color(rgb(COLOR_TEXT_SECONDARY))
-                            .child(format!("·  {context}")),
-                    ),
+                    .when(is_conversation, |title_bar| {
+                        title_bar
+                            .child(
+                                Icon::new(AppIcon::Folder)
+                                    .size(px(18.))
+                                    .text_color(rgb(COLOR_TEXT_SECONDARY)),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .max_w(px(CONVERSATION_TITLE_MAX_WIDTH))
+                                    .truncate()
+                                    .text_size(font_px(FONT_SIZE_BASE))
+                                    .font_medium()
+                                    .child(conversation_title),
+                            )
+                            .when_some(conversation_menu_data, |title_bar, data| {
+                                title_bar.child(
+                                    Button::new("header-conversation-more")
+                                        .ghost()
+                                        .small()
+                                        .h(px(32.))
+                                        .w(px(32.))
+                                        .rounded(px(8.))
+                                        .icon(Icon::new(AppIcon::More).size(px(16.)))
+                                        .dropdown_menu(move |menu, _, _| {
+                                            Self::agent_popup_menu(
+                                                menu,
+                                                header_view.clone(),
+                                                AgentMenuData {
+                                                    agent_id: data.agent_id.clone(),
+                                                    agent_title: data.agent_title.clone(),
+                                                    working_directory: data
+                                                        .working_directory
+                                                        .clone(),
+                                                    project_id: data.project_id.clone(),
+                                                    workspace_id: data.workspace_id.clone(),
+                                                },
+                                                can_mutate_agent,
+                                            )
+                                        }),
+                                )
+                            })
+                    })
+                    .when(!is_conversation, |title_bar| {
+                        title_bar
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(font_px(FONT_SIZE_BASE))
+                                    .font_medium()
+                                    .truncate()
+                                    .child(standard_title),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(font_px(FONT_SIZE_SM))
+                                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                                    .child(format!("·  {context}")),
+                            )
+                    }),
             )
             .child(div().h_flex().flex_none().items_center().gap_1().when(
                 matches!(
@@ -1365,6 +1739,7 @@ fn root_overlay_layers(
 }
 
 impl Render for ConnectionView {
+    #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_prompt_editors(window, cx);
         let status = match self.state {
@@ -1398,6 +1773,9 @@ impl Render for ConnectionView {
                 }
                 MainSection::Search => self.render_search_panel(cx).into_any_element(),
                 MainSection::Tasks => self.render_tasks_panel(is_online, cx).into_any_element(),
+                MainSection::Scheduled => self
+                    .render_scheduled_panel(is_online, window, cx)
+                    .into_any_element(),
                 MainSection::Activity => self.render_activity_panel(cx).into_any_element(),
                 MainSection::Permissions => self
                     .render_permissions_panel(is_online, cx)
@@ -1453,8 +1831,11 @@ impl Render for ConnectionView {
             .on_action(cx.listener(Self::open_new_task))
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::open_tasks))
+            .on_action(cx.listener(Self::open_scheduled))
             .on_action(cx.listener(Self::open_activity))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::capture_app_snapshot_action))
+            .on_action(cx.listener(Self::submit_prompt_action))
             .h_flex()
             .size_full()
             .items_start()
@@ -1536,17 +1917,30 @@ pub(crate) fn run() {
         gpui_component::init(cx);
         cx.bind_keys([
             KeyBinding::new("shift-enter", Enter { secondary: true }, Some("Input")),
+            KeyBinding::new("cmd-enter", SubmitPrompt, Some("Input")),
             KeyBinding::new("cmd-n", OpenNewTask, None),
             KeyBinding::new("cmd-k", OpenSearch, None),
             KeyBinding::new("cmd-1", OpenTasks, None),
             KeyBinding::new("cmd-shift-a", OpenActivity, None),
+            KeyBinding::new("cmd-shift-2", CaptureAppSnapshot, None),
             KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("ctrl-n", OpenNewTask, None),
             KeyBinding::new("ctrl-k", OpenSearch, None),
             KeyBinding::new("ctrl-1", OpenTasks, None),
             KeyBinding::new("ctrl-shift-a", OpenActivity, None),
+            KeyBinding::new("ctrl-shift-2", CaptureAppSnapshot, None),
             KeyBinding::new("ctrl-,", OpenSettings, None),
+            KeyBinding::new("ctrl-enter", SubmitPrompt, Some("Input")),
         ]);
+
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty()
+                && UiPreferences::load().general.close_window_behavior == CloseWindowBehavior::Quit
+            {
+                cx.quit();
+            }
+        })
+        .detach();
 
         #[cfg(target_os = "macos")]
         if let Err(error) = system_tray::install(cx) {

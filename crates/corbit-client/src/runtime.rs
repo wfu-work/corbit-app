@@ -7,10 +7,12 @@ use std::{
 use async_channel::{Receiver, Sender};
 use corbit_protocol::{
     AgentApprovalDecision, AgentApprovalResolveAcknowledgement, AgentInterruptAcknowledgement,
-    AgentPromptAcknowledgement, AgentPromptOptions, AuthoritativeSnapshot, DeviceCredentialSummary,
-    PairingOffer, PluginAuditEntry, PluginCommandResult, PluginInspection, PluginMarketplaceEntry,
-    PluginRecord, ProviderCatalog, ResourceMutationAcknowledgement, WorkspaceDirectoryListing,
-    WorkspaceFileContent, WorkspaceGitDiff, WorkspaceGitStatus,
+    AgentPromptAcknowledgement, AgentPromptOptions, AgentSteerAcknowledgement,
+    AuthoritativeSnapshot, CodexOfficialPluginCatalog, CodexOfficialPluginInstallResult,
+    DeviceCredentialSummary, PairingOffer, PluginInspection, PluginMarketplaceEntry, PluginRecord,
+    ProviderCatalog, ResourceMutationAcknowledgement, ScheduledRun, ScheduledTask,
+    ScheduledTaskCreateInput, ScheduledTaskDeleteAcknowledgement, ScheduledTaskUpdateInput,
+    WorkspaceDirectoryListing, WorkspaceFileContent, WorkspaceGitDiff, WorkspaceGitStatus,
 };
 use serde_json::Value;
 use tokio::{
@@ -141,6 +143,100 @@ impl DaemonRuntimeClient {
         serde_json::from_value(value).map_err(Into::into)
     }
 
+    /// Lists all active and paused scheduled tasks.
+    pub async fn scheduled_tasks(&self) -> Result<Vec<ScheduledTask>, ClientError> {
+        let value = self.rpc("schedule.list", None).await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Creates one unattended scheduled task.
+    pub async fn create_scheduled_task(
+        &self,
+        input: ScheduledTaskCreateInput,
+    ) -> Result<ScheduledTask, ClientError> {
+        let value = self
+            .rpc("schedule.create", Some(serde_json::to_value(input)?))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Updates one scheduled task without changing its active/paused state.
+    pub async fn update_scheduled_task(
+        &self,
+        input: ScheduledTaskUpdateInput,
+    ) -> Result<ScheduledTask, ClientError> {
+        let value = self
+            .rpc("schedule.update", Some(serde_json::to_value(input)?))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Pauses or resumes one scheduled task.
+    pub async fn set_scheduled_task_paused(
+        &self,
+        task_id: impl Into<String>,
+        paused: bool,
+    ) -> Result<ScheduledTask, ClientError> {
+        let value = self
+            .rpc(
+                if paused {
+                    "schedule.pause"
+                } else {
+                    "schedule.resume"
+                },
+                Some(serde_json::json!({ "taskId": task_id.into() })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Deletes one scheduled task while preserving its completed run history.
+    pub async fn delete_scheduled_task(
+        &self,
+        task_id: impl Into<String>,
+    ) -> Result<ScheduledTaskDeleteAcknowledgement, ClientError> {
+        let value = self
+            .rpc(
+                "schedule.delete",
+                Some(serde_json::json!({ "taskId": task_id.into() })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Starts one scheduled task immediately, including when it is paused.
+    pub async fn run_scheduled_task_now(
+        &self,
+        task_id: impl Into<String>,
+    ) -> Result<ScheduledRun, ClientError> {
+        let value = self
+            .rpc(
+                "schedule.runNow",
+                Some(serde_json::json!({ "taskId": task_id.into() })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Lists recent runs, optionally scoped to one scheduled task.
+    pub async fn scheduled_runs(
+        &self,
+        task_id: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Vec<ScheduledRun>, ClientError> {
+        let mut params = serde_json::Map::new();
+        if let Some(task_id) = task_id {
+            params.insert("taskId".into(), Value::String(task_id));
+        }
+        if let Some(limit) = limit {
+            params.insert("limit".into(), Value::from(limit));
+        }
+        let value = self
+            .rpc("schedule.run.list", Some(Value::Object(params)))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
     /// Lists installed built-in and local plugins.
     ///
     /// # Errors
@@ -161,22 +257,67 @@ impl DaemonRuntimeClient {
         serde_json::from_value(value).map_err(Into::into)
     }
 
-    /// Lists recent redacted plugin command audit entries.
+    /// Lists the account-aware plugin catalog exposed by Codex App Server.
     ///
     /// # Errors
     ///
-    /// Returns an error when the session is offline, the credential is not the
-    /// local root credential, or the response is invalid.
-    pub async fn plugin_audit(
+    /// Returns an error when Codex is unavailable, not authenticated, or returns
+    /// a response that the connected Daemon cannot validate.
+    pub async fn codex_official_plugins(
         &self,
-        limit: Option<u32>,
-    ) -> Result<Vec<PluginAuditEntry>, ClientError> {
-        let params = limit.map(|limit| serde_json::json!({ "limit": limit }));
-        let value = self.rpc("plugin.audit.list", params).await?;
+        force_refetch: bool,
+    ) -> Result<CodexOfficialPluginCatalog, ClientError> {
+        let value = self
+            .rpc(
+                "plugin.official.list",
+                Some(serde_json::json!({ "forceRefetch": force_refetch })),
+            )
+            .await?;
         serde_json::from_value(value).map_err(Into::into)
     }
 
-    /// Installs a local plugin directory containing `manifest.json`.
+    /// Installs one plugin through the Codex-owned remote marketplace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Codex rejects the marketplace, policy, account, or
+    /// installation request.
+    pub async fn install_codex_official_plugin(
+        &self,
+        marketplace_name: impl Into<String>,
+        plugin_name: impl Into<String>,
+    ) -> Result<CodexOfficialPluginInstallResult, ClientError> {
+        let value = self
+            .rpc(
+                "plugin.official.install",
+                Some(serde_json::json!({
+                    "marketplaceName": marketplace_name.into(),
+                    "pluginName": plugin_name.into(),
+                })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Uninstalls one Codex-owned plugin by its App Server plugin id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is managed by policy or Codex rejects
+    /// the request.
+    pub async fn uninstall_codex_official_plugin(
+        &self,
+        plugin_id: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        self.rpc(
+            "plugin.official.uninstall",
+            Some(serde_json::json!({ "pluginId": plugin_id.into() })),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Installs a local plugin directory containing `.codex-plugin/plugin.json`.
     ///
     /// # Errors
     ///
@@ -236,12 +377,12 @@ impl DaemonRuntimeClient {
         serde_json::from_value(value).map_err(Into::into)
     }
 
-    /// Installs a verified plugin from the Daemon's signed marketplace index.
+    /// Installs a plugin from the configured Codex marketplace.
     ///
     /// # Errors
     ///
     /// Returns an error when the session is offline, the marketplace is unavailable,
-    /// or the Daemon rejects the signature, integrity, or package validation.
+    /// or the Daemon rejects the selected marketplace source.
     pub async fn install_marketplace_plugin(
         &self,
         plugin_id: impl Into<String>,
@@ -291,33 +432,6 @@ impl DaemonRuntimeClient {
         )
         .await
         .map(|_| ())
-    }
-
-    /// Invokes a command exposed by an enabled plugin.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session is offline, the command is unavailable,
-    /// or the Daemon rejects the plugin process execution.
-    pub async fn execute_plugin_command(
-        &self,
-        plugin_id: impl Into<String>,
-        command_id: impl Into<String>,
-        workspace_id: Option<String>,
-        allow_workspace_write: bool,
-    ) -> Result<PluginCommandResult, ClientError> {
-        let mut params = serde_json::json!({
-            "pluginId": plugin_id.into(),
-            "commandId": command_id.into(),
-        });
-        if let Some(workspace_id) = workspace_id {
-            params["workspaceId"] = serde_json::Value::String(workspace_id);
-        }
-        if allow_workspace_write {
-            params["approvedPermissions"] = serde_json::json!(["workspace.write"]);
-        }
-        let value = self.rpc("plugin.invoke", Some(params)).await?;
-        serde_json::from_value(value).map_err(Into::into)
     }
 
     /// Lists credentials paired through the Daemon root token.
@@ -552,6 +666,33 @@ impl DaemonRuntimeClient {
                 Some(serde_json::json!({
                     "agentId": agent_id.into(),
                     "turnId": turn_id.into(),
+                    "clientMutationId": client_mutation_id.into(),
+                })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Steers one active Agent turn through the active runtime session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runtime is offline, the Provider cannot steer
+    /// the active turn, or the acknowledgement cannot be decoded.
+    pub async fn steer(
+        &self,
+        agent_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        text: impl Into<String>,
+        client_mutation_id: impl Into<String>,
+    ) -> Result<AgentSteerAcknowledgement, ClientError> {
+        let value = self
+            .rpc(
+                "agent.steer",
+                Some(serde_json::json!({
+                    "agentId": agent_id.into(),
+                    "turnId": turn_id.into(),
+                    "text": text.into(),
                     "clientMutationId": client_mutation_id.into(),
                 })),
             )

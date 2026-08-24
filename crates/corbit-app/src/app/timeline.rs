@@ -1,4 +1,4 @@
-mod composer;
+pub(in crate::app) mod composer;
 mod index;
 mod lifecycle;
 mod model;
@@ -17,24 +17,46 @@ use index::{
     closest_conversation_index_entry, conversation_index_entries,
     conversation_index_marker_metrics, interpolate_rgba, scroll_timeline_to_latest,
 };
-use lifecycle::{
-    apply_turn_completed_event, apply_turn_started_event, is_permission_placeholder,
-    remember_turn_provider,
-};
+use lifecycle::{apply_turn_completed_event, apply_turn_started_event, remember_turn_provider};
 pub(super) use model::{
-    ComposerAttachment, PendingPermission, RetryControl, RetryPrompt, TimelineIndex,
+    ComposerAttachment, PendingPermission, QueuedPrompt, RetryControl, RetryPrompt, TimelineIndex,
     TimelineStatus, TimelineTurn,
 };
 use model::{TimelineStep, TimelineStepKind, TimelineUsage};
 use provider_switch::{ProviderSwitchFailure, execute_provider_switch};
 
 const ACTIVE_TURN_INDICATOR_ANIMATION_DURATION: Duration = Duration::from_millis(1_100);
+const TIMELINE_JUMP_TO_LATEST_THRESHOLD: f32 = 48.;
+const TIMELINE_FLOATING_CONTROL_SIZE: f32 = 40.;
 const STREAMING_RESPONSE_PREVIEW_BYTES: usize = 12 * 1024;
 const LONG_RESPONSE_VIRTUALIZATION_BYTES: usize = 24 * 1024;
 const LONG_RESPONSE_VIEW_HEIGHT: f32 = 560.;
 const CONVERSATION_BODY_FONT_SIZE: f32 = 15.;
 const CONVERSATION_BODY_LINE_HEIGHT: f32 = 24.;
 const CONVERSATION_PARAGRAPH_GAP_REMS: f32 = 0.75;
+const DESKTOP_NOTIFICATION_MAX_EVENT_AGE_SECONDS: i64 = 120;
+
+fn event_is_recent(occurred_at: &str) -> bool {
+    let Ok(occurred_at) = DateTime::parse_from_rfc3339(occurred_at) else {
+        return false;
+    };
+    let age = Utc::now().signed_duration_since(occurred_at.with_timezone(&Utc));
+    age.num_seconds() >= -5 && age.num_seconds() <= DESKTOP_NOTIFICATION_MAX_EVENT_AGE_SECONDS
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TurnCompletionActions {
+    advance_queue: bool,
+    notify: bool,
+}
+
+fn turn_completion_actions(already_terminal: bool, occurred_at: &str) -> TurnCompletionActions {
+    let advance_queue = !already_terminal;
+    TurnCompletionActions {
+        advance_queue,
+        notify: advance_queue && event_is_recent(occurred_at),
+    }
+}
 
 fn conversation_markdown_style() -> TextViewStyle {
     let mut style = TextViewStyle::default()
@@ -83,6 +105,83 @@ fn final_response(turn: &TimelineTurn) -> Option<&str> {
     final_response_step(turn).map(|(_, response)| response)
 }
 
+fn shows_completed_response_footer(turn: &TimelineTurn) -> bool {
+    turn.status == TimelineStatus::Completed && final_response(turn).is_some()
+}
+
+fn automatically_expands_timeline_activity(turn: &TimelineTurn) -> bool {
+    turn.status == TimelineStatus::InProgress && final_response(turn).is_none()
+}
+
+fn timeline_activity_is_expanded(
+    turn: &TimelineTurn,
+    explicitly_expanded: bool,
+    explicitly_collapsed_while_streaming: bool,
+) -> bool {
+    if automatically_expands_timeline_activity(turn) {
+        !explicitly_collapsed_while_streaming
+    } else {
+        explicitly_expanded
+    }
+}
+
+fn permission_belongs_to_agent(
+    permission: &PendingPermission,
+    selected_agent_id: Option<&str>,
+) -> bool {
+    selected_agent_id.is_some_and(|agent_id| permission.agent_id == agent_id)
+}
+
+fn permission_kind_label(permission_kind: &str) -> &'static str {
+    match permission_kind {
+        "command" => "命令执行权限",
+        "file-change" => "文件修改权限",
+        _ => "Agent 权限",
+    }
+}
+
+fn permission_question(permission: &PendingPermission) -> String {
+    permission
+        .reason
+        .as_deref()
+        .filter(|reason| !reason.trim().is_empty())
+        .map_or_else(
+            || match permission.permission_kind.as_str() {
+                "command" => "是否允许执行此命令？".to_owned(),
+                "file-change" => "是否允许修改这些文件？".to_owned(),
+                _ => "是否允许 Agent 继续此操作？".to_owned(),
+            },
+            str::to_owned,
+        )
+}
+
+fn should_show_timeline_jump_control(
+    item_count: usize,
+    logical_scroll_item: usize,
+    last_item_bottom: Option<gpui::Pixels>,
+    viewport_bottom: gpui::Pixels,
+) -> bool {
+    item_count > 0
+        && logical_scroll_item < item_count
+        && last_item_bottom
+            .is_none_or(|bottom| bottom - viewport_bottom >= px(TIMELINE_JUMP_TO_LATEST_THRESHOLD))
+}
+
+fn timeline_is_away_from_latest(list_state: &ListState) -> bool {
+    let item_count = list_state.item_count();
+    let last_item_bottom = item_count
+        .checked_sub(1)
+        .and_then(|index| list_state.bounds_for_item(index))
+        .map(|bounds| bounds.bottom());
+
+    should_show_timeline_jump_control(
+        item_count,
+        list_state.logical_scroll_top().item_ix,
+        last_item_bottom,
+        list_state.viewport_bounds().bottom(),
+    )
+}
+
 fn tool_display_title(raw: &str) -> String {
     if !raw.contains(['_', '-', '.']) {
         return raw.to_owned();
@@ -111,17 +210,23 @@ fn tool_display_title(raw: &str) -> String {
 
 fn composer_option_variant(cx: &App) -> ButtonCustomVariant {
     ButtonCustomVariant::new(cx)
-        .foreground(rgb(COLOR_TEXT).into())
+        .foreground(rgb(COLOR_TEXT_TERTIARY).into())
         .hover(sidebar_row_hover_rgb().into())
         .active(sidebar_row_active_rgb().into())
 }
 
 fn composer_action_variant(cx: &App) -> ButtonCustomVariant {
+    let (background, foreground, hover, active) = if is_dark_mode() {
+        (0xe2_e2e2, 0x2b_2b2b, 0xf0_f0f0, 0xd2_d2d2)
+    } else {
+        (0x2b_2b2b, 0xf7_f7f7, 0x1f_1f1f, 0x3b_3b3b)
+    };
+
     ButtonCustomVariant::new(cx)
-        .color(rgb(COLOR_TEXT).into())
-        .foreground(rgb(COLOR_SURFACE).into())
-        .hover(rgb(COLOR_TEXT_SECONDARY).into())
-        .active(rgb(COLOR_TEXT_TERTIARY).into())
+        .color(fixed_rgb(background).into())
+        .foreground(fixed_rgb(foreground).into())
+        .hover(fixed_rgb(hover).into())
+        .active(fixed_rgb(active).into())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +306,7 @@ impl ConnectionView {
 
     fn composer_prompt_options(&self, provider: &str) -> corbit_client::AgentPromptOptions {
         let supports_turn_options = provider_supports_turn_options(provider);
+        let supports_codex_configuration = provider == "codex";
         corbit_client::AgentPromptOptions {
             model: supports_turn_options
                 .then(|| {
@@ -211,6 +317,13 @@ impl ConnectionView {
             permission_mode: supports_turn_options.then_some(self.composer_permission_mode),
             reasoning_effort: supports_turn_options
                 .then(|| self.composer_reasoning_effort(provider))
+                .flatten(),
+            network_access: supports_codex_configuration
+                .then_some(self.agent_configuration.network_access),
+            reasoning_summary: supports_codex_configuration
+                .then_some(self.agent_configuration.reasoning_summary),
+            personality: supports_codex_configuration
+                .then_some(self.agent_configuration.personality)
                 .flatten(),
             attachments: self
                 .prompt_attachments
@@ -267,7 +380,7 @@ impl ConnectionView {
             return;
         }
         if !self.provider_is_available(provider) {
-            self.show_validation_error("所选模型提供商当前不可用", cx);
+            self.show_validation_error("所选提供商当前不可用", cx);
             return;
         }
         let Some(snapshot) = self.snapshot.as_ref() else {
@@ -345,7 +458,11 @@ impl ConnectionView {
         cx.notify();
     }
 
-    pub(super) fn apply_timeline(&mut self, payload: corbit_client::AgentTimelinePayload) {
+    pub(super) fn apply_timeline(
+        &mut self,
+        payload: corbit_client::AgentTimelinePayload,
+        cx: &mut Context<Self>,
+    ) {
         use corbit_client::AgentTimelineEvent;
 
         let corbit_client::AgentTimelinePayload {
@@ -354,6 +471,31 @@ impl ConnectionView {
             event,
             ..
         } = payload;
+        let completion = match &event {
+            AgentTimelineEvent::TurnCompleted {
+                turn_id,
+                status,
+                error,
+                occurred_at,
+                ..
+            } => {
+                let already_terminal = self
+                    .timeline_index
+                    .location(&agent_id, turn_id)
+                    .and_then(|location| self.timeline.get(location.timeline_index))
+                    .is_some_and(|turn| turn.status != TimelineStatus::InProgress);
+                let actions = turn_completion_actions(already_terminal, occurred_at);
+                actions
+                    .advance_queue
+                    .then(|| (status.clone(), error.clone(), actions.notify))
+            }
+            _ => None,
+        };
+        if self.general_preferences.auto_follow_output
+            && self.selected_agent_id.as_deref() == Some(agent_id.as_str())
+        {
+            self.timeline_follow_pending = true;
+        }
         let provider = provider.or_else(|| {
             self.snapshot.as_ref().and_then(|snapshot| {
                 snapshot
@@ -394,6 +536,48 @@ impl ConnectionView {
                 self.apply_timeline_metadata_event(&agent_id, event);
             }
             AgentTimelineEvent::Unknown => {}
+        }
+        if let Some((status, error, should_notify)) = completion {
+            if should_notify {
+                self.notify_turn_completion(&agent_id, &status, error.as_deref());
+            }
+            self.start_next_queued_prompt(&agent_id, cx);
+        }
+    }
+
+    fn notify_turn_completion(
+        &self,
+        agent_id: &str,
+        status: &corbit_client::AgentTurnStatus,
+        error: Option<&str>,
+    ) {
+        let task_name = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.agents.iter().find(|agent| agent.id == agent_id))
+            .map_or("Corbit 任务", |agent| agent.title.as_str());
+        let (enabled, title, body) = match status {
+            corbit_client::AgentTurnStatus::Completed => (
+                self.general_preferences.notify_task_completion,
+                "任务已完成",
+                task_name.to_owned(),
+            ),
+            corbit_client::AgentTurnStatus::Interrupted => (
+                self.general_preferences.notify_task_failure,
+                "任务已停止",
+                task_name.to_owned(),
+            ),
+            corbit_client::AgentTurnStatus::Failed => (
+                self.general_preferences.notify_task_failure,
+                "任务执行失败",
+                error.map_or_else(
+                    || task_name.to_owned(),
+                    |error| format!("{task_name}：{error}"),
+                ),
+            ),
+        };
+        if enabled {
+            desktop_notifications::send(title, &body, self.general_preferences.notification_sound);
         }
     }
 
@@ -688,8 +872,27 @@ impl ConnectionView {
         }
     }
 
-    pub(super) fn apply_permission(&mut self, payload: corbit_client::AgentPermissionPayload) {
+    pub(super) fn apply_permission(
+        &mut self,
+        payload: corbit_client::AgentPermissionPayload,
+        cx: &mut Context<Self>,
+    ) {
+        let notification = match &payload.event {
+            corbit_client::AgentPermissionEvent::PermissionRequested {
+                approval_id,
+                occurred_at,
+                ..
+            } => Some((
+                approval_id.clone(),
+                occurred_at.clone(),
+                self.permissions
+                    .iter()
+                    .any(|permission| permission.approval_id == *approval_id),
+            )),
+            corbit_client::AgentPermissionEvent::PermissionResolved { .. } => None,
+        };
         let agent_id = payload.agent_id;
+        let notification_agent_id = agent_id.clone();
         let affected_turn = match payload.event {
             corbit_client::AgentPermissionEvent::PermissionRequested {
                 approval_id,
@@ -703,10 +906,6 @@ impl ConnectionView {
                 ..
             } => {
                 let affected_turn = (agent_id.clone(), turn_id.clone());
-                // Approval requests can arrive before the corresponding timeline event.
-                // Reserve the turn now so the approval is always rendered in the
-                // conversation instead of in a separate composer-adjacent surface.
-                self.timeline_turn_mut(&agent_id, &turn_id);
                 let permission = PendingPermission {
                     agent_id,
                     approval_id: approval_id.clone(),
@@ -744,6 +943,28 @@ impl ConnectionView {
         if let Some(turn) = affected_turn {
             self.timeline_dirty_turns.insert(turn);
         }
+        if let Some((_, occurred_at, already_present)) = notification
+            && !already_present
+            && event_is_recent(&occurred_at)
+            && self.general_preferences.notify_permission_requests
+        {
+            let task_name = self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .agents
+                        .iter()
+                        .find(|agent| agent.id == notification_agent_id)
+                })
+                .map_or("Corbit 任务", |agent| agent.title.as_str());
+            desktop_notifications::send(
+                "等待授权",
+                task_name,
+                self.general_preferences.notification_sound,
+            );
+        }
+        cx.notify();
     }
 
     fn timeline_turn_mut(&mut self, agent_id: &str, turn_id: &str) -> &mut TimelineTurn {
@@ -794,9 +1015,12 @@ impl ConnectionView {
         self.timeline_dirty_turns.clear();
         self.expanded_timeline_steps.clear();
         self.expanded_timeline_activity.clear();
+        self.collapsed_streaming_timeline_activity.clear();
         self.timeline_list_state.reset(0);
         self.timeline_list_agent_id = None;
         self.conversation_index_interaction.reset();
+        self.timeline_follow_pending = false;
+        self.sleep_preventer = None;
     }
 
     pub(super) fn flush_timeline_list_updates(&mut self) {
@@ -837,6 +1061,28 @@ impl ConnectionView {
         self.timeline_list_state.reset(item_count);
         self.timeline_list_agent_id = agent_id;
         self.conversation_index_interaction.reset();
+    }
+
+    pub(super) fn scroll_selected_timeline_to_latest(&self) {
+        scroll_timeline_to_latest(&self.timeline_list_state);
+    }
+
+    pub(super) fn sync_sleep_prevention(&mut self) -> anyhow::Result<()> {
+        let should_prevent = self.general_preferences.prevent_sleep_while_running
+            && self
+                .timeline
+                .iter()
+                .any(|turn| turn.status == TimelineStatus::InProgress);
+        match (should_prevent, self.sleep_preventer.is_some()) {
+            (true, false) => {
+                self.sleep_preventer = Some(sleep_prevention::SleepPreventer::start()?);
+            }
+            (false, true) => {
+                self.sleep_preventer = None;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn sync_timeline_list_state(&mut self, agent_id: Option<String>) -> ListState {
@@ -936,6 +1182,202 @@ impl ConnectionView {
         }
     }
 
+    fn active_turn_id(&self, agent_id: &str) -> Option<String> {
+        self.timeline_index
+            .agent_indices(agent_id)
+            .iter()
+            .rev()
+            .filter_map(|index| self.timeline.get(*index))
+            .find(|turn| turn.status == TimelineStatus::InProgress)
+            .map(|turn| turn.turn_id.clone())
+    }
+
+    fn clear_submitted_composer(&mut self, agent_id: &str, cx: &mut Context<Self>) {
+        self.prompt_drafts.remove(agent_id);
+        self.prompt_clear_agent_id = Some(agent_id.to_owned());
+        self.prompt_attachments.clear();
+        self.schedule_ui_state_save(cx);
+    }
+
+    fn queue_prompt(&mut self, prompt: QueuedPrompt, fallback: bool, cx: &mut Context<Self>) {
+        let agent_id = prompt.agent_id.clone();
+        self.queued_prompts.push_back(prompt);
+        self.clear_submitted_composer(&agent_id, cx);
+        let count = self
+            .queued_prompts
+            .iter()
+            .filter(|prompt| prompt.agent_id == agent_id)
+            .count();
+        if fallback {
+            self.show_info(
+                format!("当前 Provider 或附件不支持立即调整，已安全排队 · 共 {count} 条"),
+                cx,
+            );
+        } else {
+            self.show_success(format!("消息已排队 · 共 {count} 条"), cx);
+        }
+    }
+
+    fn submit_prompt_request(
+        &mut self,
+        prompt: QueuedPrompt,
+        clear_composer: bool,
+        requeue_on_error: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self
+            .runtime
+            .as_ref()
+            .map(corbit_client::DaemonRuntime::client)
+        else {
+            if requeue_on_error {
+                self.queued_prompts.push_front(prompt);
+            }
+            self.show_validation_error("Daemon 尚未连接", cx);
+            return;
+        };
+        let signature = serde_json::to_string(&(&prompt.agent_id, &prompt.text, &prompt.options))
+            .unwrap_or_else(|_| format!("{}:{}", prompt.agent_id, prompt.text));
+        let client_mutation_id = self
+            .retry_prompt
+            .as_ref()
+            .filter(|pending| pending.signature == signature)
+            .map_or_else(
+                || format!("prompt_{}", uuid::Uuid::new_v4()),
+                |pending| pending.client_mutation_id.clone(),
+            );
+        self.retry_prompt = Some(RetryPrompt {
+            signature,
+            client_mutation_id: client_mutation_id.clone(),
+        });
+        self.prompt_in_flight = true;
+        self.detail = if requeue_on_error {
+            "正在发送已排队消息…".into()
+        } else {
+            "正在提交 Prompt…".into()
+        };
+        let submitted = prompt.clone();
+        self.prompt_task = Some(cx.spawn(async move |view, cx| {
+            let result = client
+                .prompt_with_options(
+                    prompt.agent_id,
+                    prompt.text,
+                    client_mutation_id,
+                    prompt.options,
+                )
+                .await;
+            let Some(view) = view.upgrade() else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.prompt_in_flight = false;
+                match result {
+                    Ok(acknowledgement) => {
+                        view.retry_prompt = None;
+                        if clear_composer {
+                            view.clear_submitted_composer(&submitted.agent_id, cx);
+                        }
+                        view.reset_timeline_list_to_selected();
+                        view.show_success(
+                            format!("Prompt 已接受 · Turn {}", acknowledgement.turn_id),
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        if requeue_on_error {
+                            view.queued_prompts.push_front(submitted);
+                        }
+                        view.show_error(
+                            format!("Prompt 提交失败：{error}；再次提交将复用 mutation ID"),
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn steer_active_turn(
+        &mut self,
+        agent_id: String,
+        turn_id: String,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self
+            .runtime
+            .as_ref()
+            .map(corbit_client::DaemonRuntime::client)
+        else {
+            self.show_validation_error("Daemon 尚未连接", cx);
+            return;
+        };
+        let signature = format!("steer:{agent_id}:{turn_id}:{text}");
+        let client_mutation_id = self
+            .retry_prompt
+            .as_ref()
+            .filter(|pending| pending.signature == signature)
+            .map_or_else(
+                || format!("steer_{}", uuid::Uuid::new_v4()),
+                |pending| pending.client_mutation_id.clone(),
+            );
+        self.retry_prompt = Some(RetryPrompt {
+            signature,
+            client_mutation_id: client_mutation_id.clone(),
+        });
+        self.prompt_in_flight = true;
+        self.detail = "正在调整当前任务…".into();
+        let submitted_agent_id = agent_id.clone();
+        self.prompt_task = Some(cx.spawn(async move |view, cx| {
+            let result = client
+                .steer(agent_id, turn_id, text, client_mutation_id)
+                .await;
+            let Some(view) = view.upgrade() else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.prompt_in_flight = false;
+                match result {
+                    Ok(_) => {
+                        view.retry_prompt = None;
+                        view.clear_submitted_composer(&submitted_agent_id, cx);
+                        view.show_success("已将消息加入当前任务", cx);
+                    }
+                    Err(error) => {
+                        view.show_error(format!("调整当前任务失败：{error}"), cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn start_next_queued_prompt(&mut self, agent_id: &str, cx: &mut Context<Self>) {
+        if self.prompt_in_flight || !matches!(self.state, corbit_client::ConnectionState::Online) {
+            return;
+        }
+        let Some(index) = self
+            .queued_prompts
+            .iter()
+            .position(|prompt| prompt.agent_id == agent_id)
+        else {
+            return;
+        };
+        let Some(prompt) = self.queued_prompts.remove(index) else {
+            return;
+        };
+        self.submit_prompt_request(prompt, false, true, cx);
+    }
+
+    fn clear_queued_prompts(&mut self, agent_id: &str, cx: &mut Context<Self>) {
+        self.queued_prompts
+            .retain(|prompt| prompt.agent_id != agent_id);
+        self.show_info("已清空排队消息", cx);
+    }
+
     pub(super) fn send_prompt(&mut self, cx: &mut Context<Self>) {
         if self.prompt_in_flight || self.attachment_in_flight || self.provider_switch_in_flight {
             self.show_warning("Prompt 正在提交或附件正在加载，请稍候", cx);
@@ -959,14 +1401,6 @@ impl ConnectionView {
             self.show_validation_error("请输入 Prompt 或添加附件", cx);
             return;
         }
-        let Some(client) = self
-            .runtime
-            .as_ref()
-            .map(corbit_client::DaemonRuntime::client)
-        else {
-            self.show_validation_error("Daemon 尚未连接", cx);
-            return;
-        };
         if !matches!(self.state, corbit_client::ConnectionState::Online) {
             self.show_validation_error("请等待 Daemon 连接完成", cx);
             return;
@@ -977,56 +1411,40 @@ impl ConnectionView {
         }
 
         let options = self.composer_prompt_options(&provider);
-        let signature = serde_json::to_string(&(&agent_id, &text, &options))
-            .unwrap_or_else(|_| format!("{agent_id}:{text}"));
-        let client_mutation_id = self
-            .retry_prompt
-            .as_ref()
-            .filter(|pending| pending.signature == signature)
-            .map_or_else(
-                || format!("prompt_{}", uuid::Uuid::new_v4()),
-                |pending| pending.client_mutation_id.clone(),
-            );
-        self.retry_prompt = Some(RetryPrompt {
-            signature,
-            client_mutation_id: client_mutation_id.clone(),
-        });
-        self.prompt_in_flight = true;
-        self.detail = "正在提交 Prompt…".into();
-        let submitted_agent_id = agent_id.clone();
-        self.prompt_task = Some(cx.spawn(async move |view, cx| {
-            let result = client
-                .prompt_with_options(agent_id, text, client_mutation_id, options)
-                .await;
-            let Some(view) = view.upgrade() else {
-                return;
-            };
-            let _ = view.update(cx, |view, cx| {
-                view.prompt_in_flight = false;
-                match result {
-                    Ok(acknowledgement) => {
-                        view.retry_prompt = None;
-                        view.prompt_drafts.remove(&submitted_agent_id);
-                        view.prompt_clear_agent_id = Some(submitted_agent_id);
-                        view.prompt_attachments.clear();
-                        view.reset_timeline_list_to_selected();
-                        view.show_success(
-                            format!("Prompt 已接受 · Turn {}", acknowledgement.turn_id),
-                            cx,
-                        );
-                        view.schedule_ui_state_save(cx);
-                    }
-                    Err(error) => {
-                        view.show_error(
-                            format!("Prompt 提交失败：{error}；再次提交将复用原 mutation ID"),
-                            cx,
-                        );
-                    }
-                }
-                cx.notify();
-            });
-        }));
-        cx.notify();
+        let active_turn = self.active_turn_id(&agent_id);
+        if let Some(turn_id) = active_turn {
+            let can_steer = self.general_preferences.follow_up_behavior
+                == FollowUpBehavior::SteerCurrent
+                && provider == "codex"
+                && options.attachments.is_empty()
+                && !text.is_empty();
+            if can_steer {
+                self.steer_active_turn(agent_id, turn_id, text, cx);
+            } else {
+                let fallback =
+                    self.general_preferences.follow_up_behavior == FollowUpBehavior::SteerCurrent;
+                self.queue_prompt(
+                    QueuedPrompt {
+                        agent_id,
+                        text,
+                        options,
+                    },
+                    fallback,
+                    cx,
+                );
+            }
+            return;
+        }
+        self.submit_prompt_request(
+            QueuedPrompt {
+                agent_id,
+                text,
+                options,
+            },
+            true,
+            false,
+            cx,
+        );
     }
 
     fn retry_turn_prompt(&mut self, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1208,15 +1626,31 @@ impl ConnectionView {
         agent_id: &str,
         turn_id: &str,
         key: &str,
+        automatically_expanded: bool,
         cx: &mut Context<Self>,
     ) {
-        if !self.expanded_timeline_activity.remove(key) {
+        if automatically_expanded {
+            if !self.collapsed_streaming_timeline_activity.remove(key) {
+                self.collapsed_streaming_timeline_activity
+                    .insert(key.to_owned());
+            }
+        } else if !self.expanded_timeline_activity.remove(key) {
             self.expanded_timeline_activity.insert(key.to_owned());
         }
         self.timeline_dirty_turns
             .insert((agent_id.to_owned(), turn_id.to_owned()));
         self.flush_timeline_list_updates();
         cx.notify();
+    }
+
+    fn timeline_activity_expansion_state(&self, turn: &TimelineTurn, key: &str) -> (bool, bool) {
+        let automatically_expanded = automatically_expands_timeline_activity(turn);
+        let expanded = timeline_activity_is_expanded(
+            turn,
+            self.expanded_timeline_activity.contains(key),
+            self.collapsed_streaming_timeline_activity.contains(key),
+        );
+        (expanded, automatically_expanded)
     }
 
     fn render_step_code(label: &'static str, text: String) -> Div {
@@ -1698,7 +2132,7 @@ impl ConnectionView {
         cx: &mut Context<Self>,
     ) -> Div {
         let key = format!("activity:{}:{}", turn.agent_id, turn.turn_id);
-        let expanded = self.expanded_timeline_activity.contains(&key);
+        let (expanded, automatically_expanded) = self.timeline_activity_expansion_state(turn, &key);
         let final_response_index = final_response_step(turn).map(|(index, _)| index);
         let mut activity_rows = turn
             .steps
@@ -1722,7 +2156,7 @@ impl ConnectionView {
             };
             activity_rows.push(self.render_timeline_step(index, turn.steps.len(), turn, &step, cx));
         }
-        if turn.status == TimelineStatus::InProgress {
+        if automatically_expanded {
             activity_rows.push(Self::render_thinking_shimmer(&turn.turn_id));
         }
         let has_activity = !activity_rows.is_empty();
@@ -1765,6 +2199,7 @@ impl ConnectionView {
                                     &toggle_agent_id,
                                     &toggle_turn_id,
                                     &toggle_key,
+                                    automatically_expanded,
                                     cx,
                                 );
                             }))
@@ -1843,9 +2278,25 @@ impl ConnectionView {
         }
     }
 
+    fn format_context_token_count(tokens: u64) -> String {
+        if tokens < 1_000 {
+            tokens.to_string()
+        } else if tokens < 1_000_000 {
+            format!("{}k", tokens.saturating_add(500) / 1_000)
+        } else {
+            format!("{}m", tokens.saturating_add(500_000) / 1_000_000)
+        }
+    }
+
     fn format_one_decimal(value: u64, tenth: u64, suffix: &str) -> String {
         let rounded_tenths = value / tenth + u64::from(value % tenth >= tenth / 2);
-        format!("{}.{}{suffix}", rounded_tenths / 10, rounded_tenths % 10)
+        let whole = rounded_tenths / 10;
+        let decimal = rounded_tenths % 10;
+        if decimal == 0 {
+            format!("{whole}{suffix}")
+        } else {
+            format!("{whole}.{decimal}{suffix}")
+        }
     }
 
     fn latest_context_window_usage(&self, agent_id: &str) -> Option<ContextWindowUsage> {
@@ -1866,8 +2317,9 @@ impl ConnectionView {
 
     fn render_context_window_usage(usage: Option<ContextWindowUsage>) -> impl IntoElement {
         let percent = usage.map_or(0, ContextWindowUsage::percent);
-        let used_label = usage.map(|usage| Self::format_token_count(usage.used_tokens));
-        let context_label = usage.map(|usage| Self::format_token_count(usage.context_window));
+        let used_label = usage.map(|usage| Self::format_context_token_count(usage.used_tokens));
+        let context_label =
+            usage.map(|usage| Self::format_context_token_count(usage.context_window));
         let mut track_color = rgb(COLOR_TEXT_TERTIARY);
         track_color.a = 0.38;
         let progress_color = rgb(COLOR_TEXT_SECONDARY);
@@ -1876,7 +2328,7 @@ impl ConnectionView {
             .id("composer-context-window")
             .relative()
             .flex_none()
-            .size(px(20.))
+            .size(px(16.))
             .rounded_full()
             .tooltip(move |window, cx| {
                 let used_label = used_label.clone();
@@ -1892,14 +2344,14 @@ impl ConnectionView {
                             div()
                                 .text_size(font_px(FONT_SIZE_SM))
                                 .text_color(fixed_rgb(0x6f_6f6f))
-                                .child("上下文窗口"),
+                                .child("背景信息窗口："),
                         )
                         .child(
                             div()
                                 .text_size(font_px(FONT_SIZE_BASE))
                                 .font_medium()
                                 .child(if usage.is_some() {
-                                    format!("{percent}% 已用")
+                                    format!("{percent}% 已用（剩余 {}%）", 100 - percent)
                                 } else {
                                     "暂无使用数据".to_owned()
                                 }),
@@ -1908,9 +2360,9 @@ impl ConnectionView {
                             used_label.clone().zip(context_label.clone()),
                             |tooltip, (used, context)| {
                                 tooltip.child(
-                                    div().text_size(font_px(FONT_SIZE_SM)).child(format!(
-                                        "已使用 {used} tokens，共 {context} tokens"
-                                    )),
+                                    div()
+                                        .text_size(font_px(FONT_SIZE_SM))
+                                        .child(format!("已用 {used} 标记，共 {context}")),
                                 )
                             },
                         )
@@ -1927,7 +2379,7 @@ impl ConnectionView {
                 canvas(
                     move |_, _, _| {},
                     move |bounds, (), window, _| {
-                        let arc = Arc::new().inner_radius(6.5).outer_radius(8.5);
+                        let arc = Arc::new().inner_radius(5.).outer_radius(7.);
                         let track = ArcData {
                             data: &(),
                             index: 0,
@@ -1997,7 +2449,8 @@ impl ConnectionView {
         };
         let prompt_to_copy = turn.prompt.clone();
         let response_text = final_response(turn).unwrap_or_default();
-        let response_is_empty = response_text.is_empty();
+        let show_response_footer = shows_completed_response_footer(turn);
+        let response_usage_summary = turn.usage.as_ref().map(Self::timeline_usage_summary);
         let response_agent_id = turn.agent_id.clone();
         let response_turn_id = turn.turn_id.clone();
         let retry_prompt = turn.prompt.clone();
@@ -2107,11 +2560,13 @@ impl ConnectionView {
                     .gap_4()
                     .child(activity)
                     .when_some(response, gpui::ParentElement::child)
-                    .when(!response_is_empty, |conversation| {
+                    .when(show_response_footer, |conversation| {
                         conversation.child(
                             div()
                                 .h_flex()
+                                .w_full()
                                 .items_center()
+                                .gap_2()
                                 .min_h(px(24.))
                                 .text_color(rgb(COLOR_TEXT_TERTIARY))
                                 .child(
@@ -2127,7 +2582,17 @@ impl ConnectionView {
                                                 cx,
                                             );
                                         })),
-                                ),
+                                )
+                                .when_some(response_usage_summary, |footer, usage| {
+                                    footer.child(
+                                        div()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .text_size(font_px(FONT_SIZE_XS))
+                                            .line_height(px(18.))
+                                            .child(usage),
+                                    )
+                                }),
                         )
                     }),
             )
@@ -2255,27 +2720,8 @@ impl ConnectionView {
         control_in_flight: bool,
         cx: &mut Context<Self>,
     ) -> Div {
-        let permission_label = match permission.permission_kind.as_str() {
-            "command" => "命令执行权限",
-            "file-change" => "文件修改权限",
-            _ => "Agent 权限",
-        };
-        let can_accept = permission
-            .available_decisions
-            .contains(&corbit_client::AgentApprovalDecision::Accept);
-        let can_accept_for_session = permission
-            .available_decisions
-            .contains(&corbit_client::AgentApprovalDecision::AcceptForSession);
-        let can_decline = permission
-            .available_decisions
-            .contains(&corbit_client::AgentApprovalDecision::Decline);
-        let can_cancel = permission
-            .available_decisions
-            .contains(&corbit_client::AgentApprovalDecision::Cancel);
-        let accept_permission = permission.clone();
-        let session_permission = permission.clone();
-        let decline_permission = permission.clone();
-        let cancel_permission = permission.clone();
+        let permission_label = permission_kind_label(&permission.permission_kind);
+        let permission_question = permission_question(permission);
 
         div()
             .v_flex()
@@ -2315,37 +2761,14 @@ impl ConnectionView {
                             .child("需要确认"),
                     ),
             )
-            .when_some(permission.reason.clone(), |panel, reason| {
-                panel.child(
-                    div()
-                        .line_height(px(21.))
-                        .text_color(rgb(COLOR_TEXT))
-                        .child(reason),
-                )
-            })
+            .child(
+                div()
+                    .line_height(px(21.))
+                    .text_color(rgb(COLOR_TEXT))
+                    .child(permission_question),
+            )
             .when_some(permission.command.clone(), |panel, command| {
-                panel.child(
-                    div()
-                        .v_flex()
-                        .gap_1()
-                        .rounded_md()
-                        .bg(rgb(COLOR_EDITOR))
-                        .p_3()
-                        .child(
-                            div()
-                                .text_size(font_px(FONT_SIZE_XS))
-                                .text_color(rgb(COLOR_TEXT_TERTIARY))
-                                .child("命令"),
-                        )
-                        .child(
-                            div()
-                                .font_family(mono_font_family())
-                                .text_size(font_px(FONT_SIZE_MONO))
-                                .line_height(px(20.))
-                                .text_color(rgb(COLOR_TEXT))
-                                .child(command),
-                        ),
-                )
+                panel.child(Self::render_permission_command(command))
             })
             .when_some(permission.cwd.clone(), |panel, cwd| {
                 panel.child(
@@ -2361,77 +2784,239 @@ impl ConnectionView {
                         .child(format!("授权目录：{grant_root}")),
                 )
             })
+            .child(Self::render_permission_actions(
+                "panel",
+                index,
+                permission,
+                control_in_flight,
+                cx,
+            ))
+    }
+
+    fn render_composer_permission(
+        index: usize,
+        permission: &PendingPermission,
+        control_in_flight: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let permission_label = permission_kind_label(&permission.permission_kind);
+        let permission_question = permission_question(permission);
+
+        div()
+            .v_flex()
+            .w_full()
+            .gap_3()
+            .rounded(px(16.))
+            .border_1()
+            .border_color(rgb(COLOR_BORDER_HEAVY))
+            .bg(rgb(COLOR_SURFACE_UNDER))
+            .px_4()
+            .py_3()
+            .shadow_sm()
             .child(
                 div()
                     .h_flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .when(can_accept, |row| {
-                        row.child(
-                            Button::new(("permission-accept", index))
-                                .primary()
-                                .small()
-                                .label("允许一次")
-                                .loading(control_in_flight)
-                                .disabled(control_in_flight)
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.resolve_permission(
-                                        accept_permission.clone(),
-                                        corbit_client::AgentApprovalDecision::Accept,
-                                        cx,
-                                    );
-                                })),
-                        )
-                    })
-                    .when(can_accept_for_session, |row| {
-                        row.child(
-                            Button::new(("permission-accept-session", index))
-                                .outline()
-                                .small()
-                                .label("本会话允许")
-                                .disabled(control_in_flight)
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.resolve_permission(
-                                        session_permission.clone(),
-                                        corbit_client::AgentApprovalDecision::AcceptForSession,
-                                        cx,
-                                    );
-                                })),
-                        )
-                    })
-                    .when(can_decline, |row| {
-                        row.child(
-                            Button::new(("permission-decline", index))
-                                .danger()
-                                .small()
-                                .label("拒绝")
-                                .disabled(control_in_flight)
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.resolve_permission(
-                                        decline_permission.clone(),
-                                        corbit_client::AgentApprovalDecision::Decline,
-                                        cx,
-                                    );
-                                })),
-                        )
-                    })
-                    .when(can_cancel, |row| {
-                        row.child(
-                            Button::new(("permission-cancel", index))
-                                .outline()
-                                .small()
-                                .label("取消")
-                                .disabled(control_in_flight)
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.resolve_permission(
-                                        cancel_permission.clone(),
-                                        corbit_client::AgentApprovalDecision::Cancel,
-                                        cx,
-                                    );
-                                })),
-                        )
-                    }),
+                    .w_full()
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .v_flex()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_size(font_px(FONT_SIZE_XS))
+                                    .font_medium()
+                                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                                    .child(
+                                        Icon::new(AppIcon::Approval)
+                                            .size(px(14.))
+                                            .text_color(rgb(COLOR_WARNING)),
+                                    )
+                                    .child(permission_label),
+                            )
+                            .child(
+                                div()
+                                    .text_size(font_px(FONT_SIZE_BASE))
+                                    .font_semibold()
+                                    .line_height(px(22.))
+                                    .child(permission_question),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .rounded_full()
+                            .bg(rgb(COLOR_SURFACE_SECONDARY))
+                            .px_2()
+                            .py_1()
+                            .text_size(font_px(FONT_SIZE_XS))
+                            .text_color(rgb(COLOR_WARNING))
+                            .child("需要确认"),
+                    ),
             )
+            .when_some(permission.command.clone(), |card, command| {
+                card.child(Self::render_permission_command(command))
+            })
+            .when_some(permission.cwd.clone(), |card, cwd| {
+                card.child(
+                    div()
+                        .truncate()
+                        .text_size(font_px(FONT_SIZE_XS))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .child(format!("工作目录：{cwd}")),
+                )
+            })
+            .when_some(permission.grant_root.clone(), |card, grant_root| {
+                card.child(
+                    div()
+                        .truncate()
+                        .text_size(font_px(FONT_SIZE_XS))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .child(format!("授权目录：{grant_root}")),
+                )
+            })
+            .child(Self::render_permission_actions(
+                "composer",
+                index,
+                permission,
+                control_in_flight,
+                cx,
+            ))
+    }
+
+    fn render_permission_command(command: String) -> Div {
+        div()
+            .v_flex()
+            .gap_1()
+            .rounded(px(10.))
+            .border_1()
+            .border_color(rgb(COLOR_BORDER))
+            .bg(rgb(COLOR_EDITOR))
+            .px_3()
+            .py_2()
+            .child(
+                div()
+                    .text_size(font_px(FONT_SIZE_XS))
+                    .text_color(rgb(COLOR_TEXT_TERTIARY))
+                    .child("命令"),
+            )
+            .child(
+                div()
+                    .font_family(mono_font_family())
+                    .text_size(font_px(FONT_SIZE_MONO))
+                    .line_height(px(20.))
+                    .text_color(rgb(COLOR_TEXT))
+                    .child(command),
+            )
+    }
+
+    fn render_permission_actions(
+        surface: &'static str,
+        index: usize,
+        permission: &PendingPermission,
+        control_in_flight: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let can_accept = permission
+            .available_decisions
+            .contains(&corbit_client::AgentApprovalDecision::Accept);
+        let can_accept_for_session = permission
+            .available_decisions
+            .contains(&corbit_client::AgentApprovalDecision::AcceptForSession);
+        let can_decline = permission
+            .available_decisions
+            .contains(&corbit_client::AgentApprovalDecision::Decline);
+        let can_cancel = permission
+            .available_decisions
+            .contains(&corbit_client::AgentApprovalDecision::Cancel);
+        let accept_permission = permission.clone();
+        let session_permission = permission.clone();
+        let decline_permission = permission.clone();
+        let cancel_permission = permission.clone();
+
+        div()
+            .h_flex()
+            .flex_wrap()
+            .gap_2()
+            .when(can_accept, |row| {
+                row.child(
+                    Button::new(SharedString::from(format!(
+                        "{surface}-permission-accept-{index}"
+                    )))
+                    .primary()
+                    .small()
+                    .label("允许一次")
+                    .loading(control_in_flight)
+                    .disabled(control_in_flight)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.resolve_permission(
+                            accept_permission.clone(),
+                            corbit_client::AgentApprovalDecision::Accept,
+                            cx,
+                        );
+                    })),
+                )
+            })
+            .when(can_accept_for_session, |row| {
+                row.child(
+                    Button::new(SharedString::from(format!(
+                        "{surface}-permission-accept-session-{index}"
+                    )))
+                    .outline()
+                    .small()
+                    .label("本次任务允许")
+                    .disabled(control_in_flight)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.resolve_permission(
+                            session_permission.clone(),
+                            corbit_client::AgentApprovalDecision::AcceptForSession,
+                            cx,
+                        );
+                    })),
+                )
+            })
+            .when(can_decline, |row| {
+                row.child(
+                    Button::new(SharedString::from(format!(
+                        "{surface}-permission-decline-{index}"
+                    )))
+                    .outline()
+                    .small()
+                    .label("拒绝")
+                    .disabled(control_in_flight)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.resolve_permission(
+                            decline_permission.clone(),
+                            corbit_client::AgentApprovalDecision::Decline,
+                            cx,
+                        );
+                    })),
+                )
+            })
+            .when(can_cancel, |row| {
+                row.child(
+                    Button::new(SharedString::from(format!(
+                        "{surface}-permission-cancel-{index}"
+                    )))
+                    .outline()
+                    .small()
+                    .label("拒绝并停止")
+                    .disabled(control_in_flight)
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.resolve_permission(
+                            cancel_permission.clone(),
+                            corbit_client::AgentApprovalDecision::Cancel,
+                            cx,
+                        );
+                    })),
+                )
+            })
     }
 
     fn render_timeline_list_item(
@@ -2457,22 +3042,7 @@ impl ConnectionView {
             .as_deref()
             .filter(|provider| !provider.is_empty())
             .unwrap_or(fallback_provider_id);
-        let turn_agent_id = turn.agent_id.clone();
-        let turn_id = turn.turn_id.clone();
-        let related_permissions = self
-            .permissions
-            .iter()
-            .enumerate()
-            .filter(|(_, permission)| {
-                permission.agent_id == turn_agent_id && permission.turn_id == turn_id
-            })
-            .map(|(permission_index, permission)| {
-                Self::render_permission(permission_index, permission, self.control_in_flight, cx)
-            })
-            .collect::<Vec<_>>();
-        let permission_placeholder = is_permission_placeholder(turn);
-        let rendered_turn = (!permission_placeholder)
-            .then(|| self.render_timeline_turn(display_index, turn, provider_id, window, cx));
+        let rendered_turn = self.render_timeline_turn(display_index, turn, provider_id, window, cx);
 
         div()
             .w_full()
@@ -2483,13 +3053,7 @@ impl ConnectionView {
                     .w_full()
                     .max_w(content_max_width())
                     .mx_auto()
-                    .gap_3()
-                    .when(
-                        permission_placeholder && !related_permissions.is_empty(),
-                        gpui::Styled::py_6,
-                    )
-                    .when_some(rendered_turn, gpui::ParentElement::child)
-                    .children(related_permissions),
+                    .child(rendered_turn),
             )
             .into_any_element()
     }
@@ -2611,6 +3175,22 @@ impl ConnectionView {
             )
     }
 
+    fn timeline_floating_control() -> Div {
+        div()
+            .h_flex()
+            .size(px(TIMELINE_FLOATING_CONTROL_SIZE))
+            .items_center()
+            .justify_center()
+            .occlude()
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(COLOR_BORDER_HEAVY))
+            .bg(rgb(COLOR_SURFACE_SECONDARY))
+            .shadow_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(COLOR_EDITOR)))
+    }
+
     fn render_active_turn_indicator(
         agent_id: &str,
         turn_id: &str,
@@ -2645,27 +3225,44 @@ impl ConnectionView {
             .h_flex()
             .justify_center()
             .child(
-                div()
+                Self::timeline_floating_control()
                     .id(indicator_id)
-                    .h_flex()
-                    .w(px(52.))
-                    .h(px(38.))
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .occlude()
-                    .rounded(px(19.))
-                    .border_1()
-                    .border_color(rgb(COLOR_BORDER_HEAVY))
-                    .bg(rgb(COLOR_SURFACE_SECONDARY))
-                    .shadow_md()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(rgb(COLOR_EDITOR)))
                     .active(|style| style.bg(rgb(COLOR_BORDER_LIGHT)))
+                    .gap_1()
                     .tooltip(|window, cx| {
                         Tooltip::new("任务进行中 · 点击查看最新内容").build(window, cx)
                     })
                     .children(dots)
+                    .on_click(cx.listener(move |_view, _, _, cx| {
+                        scroll_timeline_to_latest(&list_state);
+                        cx.notify();
+                    })),
+            )
+    }
+
+    fn render_jump_to_latest_indicator(
+        timeline_list_state: &ListState,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let list_state = timeline_list_state.clone();
+
+        div()
+            .absolute()
+            .top(px(-32.))
+            .left_0()
+            .right_0()
+            .h_flex()
+            .justify_center()
+            .child(
+                Self::timeline_floating_control()
+                    .id("timeline-jump-to-latest")
+                    .active(|style| style.bg(rgb(COLOR_BORDER_LIGHT)))
+                    .tooltip(|window, cx| Tooltip::new("滚动到最新内容").build(window, cx))
+                    .child(
+                        Icon::new(AppIcon::ScrollToLatest)
+                            .size(px(20.))
+                            .text_color(rgb(COLOR_TEXT_SECONDARY)),
+                    )
                     .on_click(cx.listener(move |_view, _, _, cx| {
                         scroll_timeline_to_latest(&list_state);
                         cx.notify();
@@ -2685,6 +3282,16 @@ impl ConnectionView {
             let selected = selected_agent_id.as_ref()?;
             snapshot.agents.iter().find(|agent| &agent.id == selected)
         });
+        let conversation_permissions = self
+            .permissions
+            .iter()
+            .enumerate()
+            .filter(|(_, permission)| {
+                permission_belongs_to_agent(permission, selected_agent_id.as_deref())
+            })
+            .map(|(index, permission)| (index, permission.clone()))
+            .collect::<Vec<_>>();
+        let has_conversation_permissions = !conversation_permissions.is_empty();
         let selected_agent_exists = selected_agent.is_some();
         let selected_agent_running =
             selected_agent.is_some_and(|agent| agent.status == corbit_client::AgentStatus::Running);
@@ -2708,8 +3315,7 @@ impl ConnectionView {
             && !self.prompt_in_flight
             && !self.attachment_in_flight
             && !self.provider_switch_in_flight
-            && provider_prompt_blocker.is_none()
-            && active_turn.is_none();
+            && provider_prompt_blocker.is_none();
         let turn_count = selected_agent_id.as_deref().map_or(0, |agent_id| {
             self.timeline_index.agent_indices(agent_id).len()
         });
@@ -2731,7 +3337,10 @@ impl ConnectionView {
         } else if !selected_agent_running {
             "请先在工作区管理中启动 Agent".to_owned()
         } else if active_turn.is_some() {
-            "Agent 正在处理当前任务".to_owned()
+            match self.general_preferences.follow_up_behavior {
+                FollowUpBehavior::SteerCurrent => "回车可立即调整当前任务".to_owned(),
+                FollowUpBehavior::QueueNext => "回车会将消息排队到下一轮".to_owned(),
+            }
         } else if let Some(message) = &provider_prompt_blocker {
             message.clone()
         } else {
@@ -2741,8 +3350,8 @@ impl ConnectionView {
         let composer_action = if let Some((agent_id, turn_id)) = active_turn.clone() {
             Button::new("interrupt-turn")
                 .custom(action_variant)
-                .with_size(px(34.))
-                .rounded(px(17.))
+                .with_size(px(30.))
+                .rounded(px(15.))
                 .icon(Icon::new(AppIcon::Stop))
                 .tooltip("停止处理")
                 .loading(self.control_in_flight)
@@ -2753,8 +3362,8 @@ impl ConnectionView {
         } else {
             Button::new("send-prompt")
                 .custom(action_variant)
-                .with_size(px(34.))
-                .rounded(px(17.))
+                .with_size(px(30.))
+                .rounded(px(15.))
                 .icon(Icon::new(AppIcon::Send))
                 .tooltip("发送问题 · 回车")
                 .loading(self.prompt_in_flight)
@@ -2775,7 +3384,7 @@ impl ConnectionView {
             .child(provider_badge(&provider_id, ProviderBadgeSize::Inline))
             .child(Self::provider_label(&provider_id).to_owned())
             .dropdown_caret(true)
-            .tooltip("切换当前项目的模型提供商")
+            .tooltip("切换当前项目的提供商")
             .loading(self.provider_switch_in_flight)
             .disabled(
                 !is_online
@@ -2826,7 +3435,7 @@ impl ConnectionView {
                     "Provider 默认".to_owned()
                 }
             },
-            |model| model.display_name.clone(),
+            |model| model_display_name(&model.id, &model.display_name),
         );
         let model_choices = self
             .provider_catalog_entry(&provider_id)
@@ -2840,9 +3449,8 @@ impl ConnectionView {
             .xsmall()
             .rounded(px(10.))
             .label(model_label)
-            .dropdown_caret(true)
             .tooltip(if supports_turn_options {
-                "选择本次 Turn 使用的模型"
+                "选择模型"
             } else {
                 "当前 Provider 使用自己的默认模型"
             })
@@ -2858,22 +3466,12 @@ impl ConnectionView {
                         .is_some_and(|selected| selected.id == model.id);
                     menu = menu.item(
                         PopupMenuItem::element(move |_, _| {
-                            div()
-                                .v_flex()
-                                .min_w_0()
-                                .py_1()
-                                .child(
-                                    div()
-                                        .text_size(font_px(FONT_SIZE_SM))
-                                        .font_medium()
-                                        .child(model.display_name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(font_px(FONT_SIZE_XS))
-                                        .text_color(rgb(COLOR_TEXT_SECONDARY))
-                                        .child(model.description.clone()),
-                                )
+                            div().v_flex().min_w_0().py_1().child(
+                                div()
+                                    .text_size(font_px(FONT_SIZE_SM))
+                                    .font_medium()
+                                    .child(model_display_name(&model.id, &model.display_name)),
+                            )
                         })
                         .checked(checked)
                         .on_click(move |_, _, cx| {
@@ -2936,6 +3534,7 @@ impl ConnectionView {
                         .on_click(move |_, _, cx| {
                             item_view.update(cx, |view, cx| {
                                 view.composer_permission_mode = mode;
+                                view.schedule_ui_state_save(cx);
                                 cx.notify();
                             });
                         }),
@@ -2955,10 +3554,9 @@ impl ConnectionView {
             .custom(option_variant)
             .xsmall()
             .rounded(px(10.))
-            .label(reasoning_effort.map_or("默认推理", reasoning_effort_label))
-            .dropdown_caret(true)
+            .label(reasoning_effort.map_or("默认", reasoning_effort_short_label))
             .tooltip(if supports_turn_options {
-                "选择本次 Turn 的推理程度"
+                "选择推理等级"
             } else {
                 "当前 Provider 管理自己的推理程度"
             })
@@ -2971,24 +3569,12 @@ impl ConnectionView {
                     let item_provider = reasoning_provider.clone();
                     menu = menu.item(
                         PopupMenuItem::element(move |_, _| {
-                            div()
-                                .v_flex()
-                                .min_w_0()
-                                .py_1()
-                                .child(
-                                    div()
-                                        .text_size(font_px(FONT_SIZE_SM))
-                                        .font_medium()
-                                        .child(reasoning_effort_short_label(effort)),
-                                )
-                                .when_some(choice.description.clone(), |item, description| {
-                                    item.child(
-                                        div()
-                                            .text_size(font_px(FONT_SIZE_XS))
-                                            .text_color(rgb(COLOR_TEXT_SECONDARY))
-                                            .child(description),
-                                    )
-                                })
+                            div().v_flex().min_w_0().py_1().child(
+                                div()
+                                    .text_size(font_px(FONT_SIZE_SM))
+                                    .font_medium()
+                                    .child(reasoning_effort_short_label(effort)),
+                            )
                         })
                         .checked(reasoning_effort == Some(effort))
                         .on_click(move |_, _, cx| {
@@ -3066,6 +3652,24 @@ impl ConnectionView {
                     )
             })
             .collect::<Vec<_>>();
+        let composer_permissions = conversation_permissions
+            .iter()
+            .map(|(index, permission)| {
+                Self::render_composer_permission(
+                    *index,
+                    permission,
+                    self.control_in_flight || !is_online,
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
+        let queued_prompt_count = selected_agent_id.as_deref().map_or(0, |agent_id| {
+            self.queued_prompts
+                .iter()
+                .filter(|prompt| prompt.agent_id == agent_id)
+                .count()
+        });
+        let queued_prompt_agent_id = selected_agent_id.clone().unwrap_or_default();
         let recovery_banner = self
             .new_task_recovery
             .as_ref()
@@ -3078,9 +3682,23 @@ impl ConnectionView {
         let context_window_indicator =
             selected_agent_exists.then(|| Self::render_context_window_usage(context_window_usage));
         let timeline_list_state = self.sync_timeline_list_state(selected_agent_id.clone());
-        let active_turn_indicator = active_turn.as_ref().map(|(agent_id, turn_id)| {
-            Self::render_active_turn_indicator(agent_id, turn_id, &timeline_list_state, cx)
-        });
+        let timeline_floating_control = if has_conversation_permissions {
+            None
+        } else if let Some((agent_id, turn_id)) = active_turn.as_ref() {
+            Some(Self::render_active_turn_indicator(
+                agent_id,
+                turn_id,
+                &timeline_list_state,
+                cx,
+            ))
+        } else if timeline_is_away_from_latest(&timeline_list_state) {
+            Some(Self::render_jump_to_latest_indicator(
+                &timeline_list_state,
+                cx,
+            ))
+        } else {
+            None
+        };
         let list_agent_id = selected_agent_id.clone();
         let list_provider_id = provider_id.clone();
         let virtual_timeline = list(
@@ -3200,83 +3818,123 @@ impl ConnectionView {
                             .w_full()
                             .max_w(content_max_width())
                             .mx_auto()
-                            .min_h(px(116.))
-                            .rounded(px(20.))
-                            .border_1()
-                            .border_color(rgb(COLOR_BORDER_HEAVY))
-                            .bg(rgb(COLOR_EDITOR))
-                            .px_2()
-                            .pt_2()
-                            .pb_2()
-                            .shadow_sm()
-                            .child(
-                                div().w_full().flex_1().min_h(px(60.)).child(
-                                    Input::new(&self.prompt_input)
-                                        .appearance(false)
-                                        .disabled(!can_prompt),
-                                ),
-                            )
-                            .when(!attachment_chips.is_empty(), |composer| {
+                            .gap_2()
+                            .children(composer_permissions)
+                            .when(queued_prompt_count > 0, |composer| {
                                 composer.child(
                                     div()
                                         .h_flex()
                                         .w_full()
-                                        .flex_wrap()
-                                        .gap_2()
-                                        .px_2()
-                                        .pb_2()
-                                        .children(attachment_chips),
+                                        .items_center()
+                                        .justify_between()
+                                        .rounded(px(10.))
+                                        .bg(rgb(COLOR_SURFACE_SECONDARY))
+                                        .px_3()
+                                        .py_2()
+                                        .text_size(font_px(FONT_SIZE_XS))
+                                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                                        .child(format!(
+                                            "已排队 {queued_prompt_count} 条消息，将在当前任务结束后发送"
+                                        ))
+                                        .child(
+                                            Button::new("clear-queued-prompts")
+                                                .ghost()
+                                                .xsmall()
+                                                .label("清空")
+                                                .on_click(cx.listener(move |view, _, _, cx| {
+                                                    view.clear_queued_prompts(
+                                                        &queued_prompt_agent_id,
+                                                        cx,
+                                                    );
+                                                })),
+                                        ),
                                 )
                             })
                             .child(
                                 div()
-                                    .h_flex()
+                                    .v_flex()
                                     .w_full()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_2()
-                                    .pl_1()
-                                    .pr_2()
+                                    .min_h(px(116.))
+                                    .rounded(px(20.))
+                                    .border_1()
+                                    .border_color(rgb(COLOR_BORDER_HEAVY))
+                                    .bg(rgb(COLOR_EDITOR))
+                                    .px_2()
+                                    .pt_2()
+                                    .pb_2()
+                                    .shadow_sm()
+                                    .child(
+                                        div().w_full().flex_1().min_h(px(60.)).child(
+                                            Input::new(&self.prompt_input)
+                                                .appearance(false)
+                                                .disabled(!can_prompt),
+                                        ),
+                                    )
+                                    .when(!attachment_chips.is_empty(), |composer| {
+                                        composer.child(
+                                            div()
+                                                .h_flex()
+                                                .w_full()
+                                                .flex_wrap()
+                                                .gap_2()
+                                                .px_2()
+                                                .pb_2()
+                                                .children(attachment_chips),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .h_flex()
-                                            .min_w(px(0.))
-                                            .flex_wrap()
+                                            .w_full()
                                             .items_center()
-                                            .gap_1()
-                                            .child(attachment_button)
-                                            .child(provider_button)
-                                            .child(permission_button),
-                                    )
-                                    .child(
-                                        div()
-                                            .min_w(px(0.))
-                                            .flex_1()
-                                            .truncate()
-                                            .text_size(font_px(FONT_SIZE_XS))
-                                            .text_color(rgb(COLOR_TEXT_TERTIARY))
-                                            .when(!can_prompt, move |status| {
-                                                status.child(prompt_hint)
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .h_flex()
-                                            .flex_none()
-                                            .items_center()
-                                            .gap_1()
-                                            .when_some(
-                                                context_window_indicator,
-                                                gpui::ParentElement::child,
+                                            .justify_between()
+                                            .gap_2()
+                                            .pl_1()
+                                            .pr_2()
+                                            .child(
+                                                div()
+                                                    .h_flex()
+                                                    .min_w(px(0.))
+                                                    .flex_wrap()
+                                                    .items_center()
+                                                    .gap_1()
+                                                    .child(attachment_button)
+                                                    .child(provider_button)
+                                                    .child(permission_button),
                                             )
-                                            .child(model_button)
-                                            .child(reasoning_button)
-                                            .child(composer_action),
+                                            .child(
+                                                div()
+                                                    .min_w(px(0.))
+                                                    .flex_1()
+                                                    .truncate()
+                                                    .text_size(font_px(FONT_SIZE_XS))
+                                                    .text_color(rgb(COLOR_TEXT_TERTIARY))
+                                                    .when(
+                                                        !can_prompt || active_turn.is_some(),
+                                                        move |status| {
+                                                        status.child(prompt_hint)
+                                                        },
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .h_flex()
+                                                    .flex_none()
+                                                    .items_center()
+                                                    .gap_1()
+                                                    .when_some(
+                                                        context_window_indicator,
+                                                        gpui::ParentElement::child,
+                                                    )
+                                                    .child(model_button)
+                                                    .child(reasoning_button)
+                                                    .child(composer_action),
+                                            ),
                                     ),
                             ),
                     )
-                    .when_some(active_turn_indicator, |composer, indicator| {
-                        composer.child(indicator)
+                    .when_some(timeline_floating_control, |composer, control| {
+                        composer.child(control)
                     }),
             )
     }
@@ -3285,6 +3943,24 @@ impl ConnectionView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_first_completion_advances_queue_without_notifying() {
+        assert_eq!(
+            turn_completion_actions(false, "2000-01-01T00:00:00Z"),
+            TurnCompletionActions {
+                advance_queue: true,
+                notify: false,
+            }
+        );
+        assert_eq!(
+            turn_completion_actions(true, "2000-01-01T00:00:00Z"),
+            TurnCompletionActions {
+                advance_queue: false,
+                notify: false,
+            }
+        );
+    }
 
     #[test]
     fn streaming_response_preview_bounds_layout_work_on_utf8_boundaries() {
@@ -3370,11 +4046,100 @@ mod tests {
     }
 
     #[test]
+    fn response_footer_is_only_shown_after_successful_completion() {
+        let mut turn = TimelineTurn {
+            agent_id: "agent-1".into(),
+            turn_id: "turn-1".into(),
+            provider: Some("codex".into()),
+            prompt: "问题".into(),
+            steps: vec![TimelineStep {
+                item_id: "message-final".into(),
+                status: corbit_client::AgentTimelineStepStatus::InProgress,
+                kind: TimelineStepKind::AssistantMessage {
+                    text: "正在生成的回答".into(),
+                },
+            }],
+            diff: None,
+            usage: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            status: TimelineStatus::InProgress,
+            error: None,
+        };
+
+        assert!(!shows_completed_response_footer(&turn));
+
+        turn.status = TimelineStatus::Interrupted;
+        assert!(!shows_completed_response_footer(&turn));
+
+        turn.status = TimelineStatus::Failed;
+        assert!(!shows_completed_response_footer(&turn));
+
+        turn.status = TimelineStatus::Completed;
+        assert!(shows_completed_response_footer(&turn));
+
+        turn.steps.clear();
+        assert!(!shows_completed_response_footer(&turn));
+    }
+
+    #[test]
+    fn activity_auto_expands_until_the_final_response_starts() {
+        let mut turn = TimelineTurn {
+            agent_id: "agent-1".into(),
+            turn_id: "turn-1".into(),
+            provider: Some("codex".into()),
+            prompt: "问题".into(),
+            steps: vec![TimelineStep {
+                item_id: "reasoning-1".into(),
+                status: corbit_client::AgentTimelineStepStatus::InProgress,
+                kind: TimelineStepKind::Reasoning {
+                    text: "正在分析实现".into(),
+                },
+            }],
+            diff: None,
+            usage: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            status: TimelineStatus::InProgress,
+            error: None,
+        };
+
+        assert!(automatically_expands_timeline_activity(&turn));
+        assert!(timeline_activity_is_expanded(&turn, false, false));
+        assert!(!timeline_activity_is_expanded(&turn, false, true));
+
+        turn.steps.push(TimelineStep {
+            item_id: "message-final".into(),
+            status: corbit_client::AgentTimelineStepStatus::InProgress,
+            kind: TimelineStepKind::AssistantMessage {
+                text: "这是最终回答。".into(),
+            },
+        });
+
+        assert!(!automatically_expands_timeline_activity(&turn));
+        assert!(!timeline_activity_is_expanded(&turn, false, false));
+        assert!(timeline_activity_is_expanded(&turn, true, false));
+
+        turn.status = TimelineStatus::Completed;
+        assert!(!automatically_expands_timeline_activity(&turn));
+        assert!(!timeline_activity_is_expanded(&turn, false, false));
+    }
+
+    #[test]
     fn context_window_percentage_rounds_and_clamps() {
         assert_eq!(context_window_percent(211_000, 258_000), 82);
         assert_eq!(context_window_percent(0, 258_000), 0);
         assert_eq!(context_window_percent(300_000, 258_000), 100);
         assert_eq!(context_window_percent(1, 0), 0);
+    }
+
+    #[test]
+    fn context_window_token_copy_uses_codex_compact_counts() {
+        assert_eq!(ConnectionView::format_context_token_count(48_000), "48k");
+        assert_eq!(ConnectionView::format_context_token_count(258_400), "258k");
+        assert_eq!(ConnectionView::format_context_token_count(1_200_000), "1m");
     }
 
     #[test]
@@ -3390,7 +4155,7 @@ mod tests {
             permission_mode_copy(corbit_client::AgentPermissionMode::WorkspaceWrite),
             composer::PermissionModeCopy {
                 title: "帮我批准",
-                description: "仅对检测到的风险操作请求批准",
+                description: "自动审查低风险权限请求，高风险操作仍会询问",
             }
         );
         assert_eq!(
@@ -3403,7 +4168,36 @@ mod tests {
     }
 
     #[test]
-    fn permission_placeholder_does_not_render_a_fake_turn() {
+    fn composer_permission_only_matches_the_selected_agent() {
+        let permission = PendingPermission {
+            agent_id: "agent-1".into(),
+            approval_id: "approval-1".into(),
+            turn_id: "turn-1".into(),
+            permission_kind: "command".into(),
+            reason: Some("是否允许运行检查？".into()),
+            command: Some("make check".into()),
+            cwd: Some("/workspace".into()),
+            grant_root: None,
+            available_decisions: vec![corbit_client::AgentApprovalDecision::Accept],
+        };
+
+        assert!(permission_belongs_to_agent(&permission, Some("agent-1")));
+        assert!(!permission_belongs_to_agent(&permission, Some("agent-2")));
+        assert!(!permission_belongs_to_agent(&permission, None));
+        assert_eq!(permission_question(&permission), "是否允许运行检查？");
+
+        let fallback_permission = PendingPermission {
+            reason: Some("   ".into()),
+            ..permission
+        };
+        assert_eq!(
+            permission_question(&fallback_permission),
+            "是否允许执行此命令？"
+        );
+    }
+
+    #[test]
+    fn replayed_provider_metadata_keeps_the_first_provider() {
         let mut turn = TimelineTurn {
             agent_id: "agent-1".into(),
             turn_id: "turn-1".into(),
@@ -3419,24 +4213,9 @@ mod tests {
             error: None,
         };
 
-        assert!(is_permission_placeholder(&turn));
         remember_turn_provider(&mut turn, Some("codex"));
         remember_turn_provider(&mut turn, Some("claude"));
         assert_eq!(turn.provider.as_deref(), Some("codex"));
-        assert!(is_permission_placeholder(&turn));
-
-        turn.started_at = Some("2026-08-17T00:00:00Z".into());
-        assert!(!is_permission_placeholder(&turn));
-
-        turn.started_at = None;
-        turn.steps.push(TimelineStep {
-            item_id: "message-1".into(),
-            status: corbit_client::AgentTimelineStepStatus::InProgress,
-            kind: TimelineStepKind::AssistantMessage {
-                text: "已开始处理".into(),
-            },
-        });
-        assert!(!is_permission_placeholder(&turn));
     }
 
     #[test]
@@ -3678,6 +4457,25 @@ mod tests {
         assert!(
             active_turn_indicator_dot_opacity(0.50, 1) > active_turn_indicator_dot_opacity(0.50, 0)
         );
+    }
+
+    #[test]
+    fn idle_jump_control_requires_meaningful_distance_from_latest() {
+        assert!(!should_show_timeline_jump_control(0, 0, None, px(0.)));
+        assert!(!should_show_timeline_jump_control(4, 4, None, px(0.)));
+        assert!(!should_show_timeline_jump_control(
+            4,
+            2,
+            Some(px(47.)),
+            px(0.)
+        ));
+        assert!(should_show_timeline_jump_control(
+            4,
+            2,
+            Some(px(48.)),
+            px(0.)
+        ));
+        assert!(should_show_timeline_jump_control(4, 1, None, px(0.)));
     }
 
     #[test]

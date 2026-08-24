@@ -1079,6 +1079,8 @@ dependencies = [
  "gpui",
  "gpui-component",
  "image",
+ "objc2",
+ "objc2-foundation",
  "security-framework",
  "security-framework-sys",
  "serde",

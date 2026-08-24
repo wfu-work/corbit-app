@@ -70,14 +70,10 @@ pub(crate) fn provider_supports_turn_options(provider_id: &str) -> bool {
     matches!(provider_id, "codex" | "claude")
 }
 
-pub(crate) fn reasoning_effort_label(effort: corbit_client::AgentReasoningEffort) -> &'static str {
-    match effort {
-        corbit_client::AgentReasoningEffort::Low => "低推理",
-        corbit_client::AgentReasoningEffort::Medium => "中推理",
-        corbit_client::AgentReasoningEffort::High => "高推理",
-        corbit_client::AgentReasoningEffort::Xhigh => "极高推理",
-        corbit_client::AgentReasoningEffort::Max => "最高推理",
-        corbit_client::AgentReasoningEffort::Ultra => "超强推理",
+pub(crate) fn model_display_name(model_id: &str, catalog_display_name: &str) -> String {
+    match model_id {
+        "gpt-5.6-sol" => "GPT-5.6-sol".into(),
+        _ => catalog_display_name.into(),
     }
 }
 
@@ -116,6 +112,18 @@ mod tests {
     fn provider_label_preserves_unknown_ids() {
         assert_eq!(provider_label("codex"), "Codex");
         assert_eq!(provider_label("custom-provider"), "custom-provider");
+    }
+
+    #[test]
+    fn model_display_name_uses_canonical_sol_casing() {
+        assert_eq!(
+            model_display_name("gpt-5.6-sol", "GPT-5.6-Sol"),
+            "GPT-5.6-sol"
+        );
+        assert_eq!(
+            model_display_name("custom-model", "Custom Model"),
+            "Custom Model"
+        );
     }
 
     #[test]

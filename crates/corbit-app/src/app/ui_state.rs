@@ -8,11 +8,109 @@ use anyhow::{Context as _, anyhow};
 use gpui::{Bounds, WindowBounds, point, px, size};
 use serde::{Deserialize, Serialize};
 
+use super::coding::CodingPreferences;
+use super::integrations::IntegrationPreferences;
 use super::theme::{SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
 use super::{ComposerSelections, MainSection, PendingNewTaskRecovery, ResourceSection, TaskFilter};
 
 const MIN_WINDOW_WIDTH: f32 = 720.;
 const MIN_WINDOW_HEIGHT: f32 = 520.;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum StartupDestination {
+    #[default]
+    RestoreLast,
+    NewTask,
+    Tasks,
+}
+
+impl StartupDestination {
+    pub(super) const fn resolve(self, restored: MainSection) -> MainSection {
+        match self {
+            Self::RestoreLast => restored,
+            Self::NewTask => MainSection::NewTask,
+            Self::Tasks => MainSection::Tasks,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CloseWindowBehavior {
+    Quit,
+    #[default]
+    KeepInMenuBar,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum FollowUpBehavior {
+    SteerCurrent,
+    #[default]
+    QueueNext,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum PromptSubmitBehavior {
+    #[default]
+    Enter,
+    CommandEnter,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
+pub(super) struct GeneralPreferences {
+    pub(super) startup_destination: StartupDestination,
+    pub(super) close_window_behavior: CloseWindowBehavior,
+    pub(super) save_prompt_drafts: bool,
+    pub(super) follow_up_behavior: FollowUpBehavior,
+    pub(super) prompt_submit_behavior: PromptSubmitBehavior,
+    pub(super) auto_follow_output: bool,
+    pub(super) prevent_sleep_while_running: bool,
+    pub(super) notify_permission_requests: bool,
+    pub(super) notify_task_completion: bool,
+    pub(super) notify_task_failure: bool,
+    pub(super) notification_sound: bool,
+}
+
+impl Default for GeneralPreferences {
+    fn default() -> Self {
+        Self {
+            startup_destination: StartupDestination::RestoreLast,
+            close_window_behavior: CloseWindowBehavior::KeepInMenuBar,
+            save_prompt_drafts: true,
+            follow_up_behavior: FollowUpBehavior::QueueNext,
+            prompt_submit_behavior: PromptSubmitBehavior::Enter,
+            auto_follow_output: false,
+            prevent_sleep_while_running: false,
+            notify_permission_requests: false,
+            notify_task_completion: false,
+            notify_task_failure: false,
+            notification_sound: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(super) struct AgentConfigurationPreferences {
+    pub(super) network_access: bool,
+    pub(super) reasoning_summary: corbit_client::AgentReasoningSummary,
+    pub(super) personality: Option<corbit_client::AgentPersonality>,
+}
+
+impl Default for AgentConfigurationPreferences {
+    fn default() -> Self {
+        Self {
+            network_access: false,
+            reasoning_summary: corbit_client::AgentReasoningSummary::Auto,
+            personality: None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -165,6 +263,10 @@ impl WindowPlacement {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct UiPreferences {
+    pub(super) general: GeneralPreferences,
+    pub(super) agent_configuration: AgentConfigurationPreferences,
+    pub(super) coding: CodingPreferences,
+    pub(super) integrations: IntegrationPreferences,
     pub(super) sidebar_collapsed: bool,
     pub(super) main_section: MainSection,
     pub(super) settings_return_section: MainSection,
@@ -175,6 +277,7 @@ pub(super) struct UiPreferences {
     pub(super) selected_provider: String,
     pub(super) project_providers: BTreeMap<String, String>,
     pub(super) composer_selections: ComposerSelections,
+    pub(super) composer_permission_mode: corbit_client::AgentPermissionMode,
     pub(super) task_filter: TaskFilter,
     pub(super) new_task_draft: String,
     pub(super) prompt_drafts: BTreeMap<String, String>,
@@ -186,6 +289,10 @@ pub(super) struct UiPreferences {
 impl Default for UiPreferences {
     fn default() -> Self {
         Self {
+            general: GeneralPreferences::default(),
+            agent_configuration: AgentConfigurationPreferences::default(),
+            coding: CodingPreferences::default(),
+            integrations: IntegrationPreferences::default(),
             sidebar_collapsed: false,
             main_section: MainSection::NewTask,
             settings_return_section: MainSection::NewTask,
@@ -196,6 +303,7 @@ impl Default for UiPreferences {
             selected_provider: "codex".into(),
             project_providers: BTreeMap::new(),
             composer_selections: ComposerSelections::default(),
+            composer_permission_mode: corbit_client::AgentPermissionMode::WorkspaceWrite,
             task_filter: TaskFilter::All,
             new_task_draft: String::new(),
             prompt_drafts: BTreeMap::new(),
@@ -223,6 +331,12 @@ impl UiPreferences {
             fs::read(path).with_context(|| format!("无法读取界面状态 {}", path.display()))?;
         let mut preferences: Self = serde_json::from_slice(&bytes)
             .with_context(|| format!("无法解析界面状态 {}", path.display()))?;
+        if matches!(
+            preferences.resource_section,
+            ResourceSection::Workspaces | ResourceSection::Agents
+        ) {
+            preferences.resource_section = ResourceSection::Projects;
+        }
         preferences.panel_widths = preferences.panel_widths.normalized();
         Ok(preferences)
     }
@@ -278,10 +392,28 @@ mod tests {
         let mut prompt_drafts = BTreeMap::new();
         prompt_drafts.insert("agent-1".into(), "继续实现测试".into());
         let preferences = UiPreferences {
+            general: GeneralPreferences {
+                startup_destination: StartupDestination::Tasks,
+                close_window_behavior: CloseWindowBehavior::Quit,
+                follow_up_behavior: FollowUpBehavior::SteerCurrent,
+                prompt_submit_behavior: PromptSubmitBehavior::CommandEnter,
+                auto_follow_output: true,
+                prevent_sleep_while_running: true,
+                notify_permission_requests: true,
+                notify_task_completion: true,
+                notify_task_failure: true,
+                ..GeneralPreferences::default()
+            },
+            agent_configuration: AgentConfigurationPreferences {
+                network_access: true,
+                reasoning_summary: corbit_client::AgentReasoningSummary::Detailed,
+                personality: Some(corbit_client::AgentPersonality::Pragmatic),
+            },
             sidebar_collapsed: true,
             main_section: MainSection::Conversation,
-            resource_section: ResourceSection::Appearance,
+            resource_section: ResourceSection::ThirdPartyLicenses,
             selected_agent_id: Some("agent-1".into()),
+            composer_permission_mode: corbit_client::AgentPermissionMode::FullAccess,
             task_filter: TaskFilter::Active,
             prompt_drafts,
             panel_widths: PanelWidths {

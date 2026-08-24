@@ -73,7 +73,8 @@ const CODEX_DARK_SIDEBAR_BORDER: u32 = 0x24_2424;
 const CODEX_DARK_SIDEBAR_ROW_HOVER: u32 = 0x3a_3b3d;
 const CODEX_DARK_SIDEBAR_ROW_ACTIVE: u32 = 0x42_4244;
 const CODEX_DARK_POPOVER: u32 = 0x2b_2b2c;
-const CODEX_SELECTION_BLUE: u32 = 0x06_6dca;
+const CODEX_DARK_SELECTION: u32 = 0x2d_4054;
+const CODEX_LIGHT_SELECTION_BLUE: u32 = 0x06_6dca;
 
 static DARK_MODE: AtomicBool = AtomicBool::new(false);
 static ACCENT_COLOR: AtomicU32 = AtomicU32::new(COLOR_ACCENT_BLUE);
@@ -280,11 +281,14 @@ fn sidebar_accent_hex(background: u32, foreground: u32) -> u32 {
 }
 
 fn selection_background_hex(background: u32, is_dark: bool) -> u32 {
-    blend_hex(
-        background,
-        CODEX_SELECTION_BLUE,
-        if is_dark { 300 } else { 220 },
-    )
+    if is_dark {
+        if background == CODEX_DARK_BACKGROUND {
+            return CODEX_DARK_SELECTION;
+        }
+        return blend_hex(background, CODEX_DARK_SELECTION, 850);
+    }
+
+    blend_hex(background, CODEX_LIGHT_SELECTION_BLUE, 220)
 }
 
 pub(super) fn shell_background() -> Rgba {
@@ -534,7 +538,7 @@ mod tests {
     fn text_selection_matches_codex_without_using_the_accent_color() {
         assert_eq!(
             selection_background_hex(CODEX_DARK_BACKGROUND, true),
-            0x0f_2e4a
+            CODEX_DARK_SELECTION
         );
         assert_eq!(selection_background_hex(0xff_ffff, false), 0xc8_dff3);
     }

@@ -228,7 +228,7 @@ async fn execute_new_task_attempt(
                 return failed_new_task_attempt(
                     recovery,
                     latest_snapshot,
-                    format!("模型提供商启动失败：{error}"),
+                    format!("提供商启动失败：{error}"),
                 );
             }
         }
@@ -541,6 +541,7 @@ impl ConnectionView {
         provider: &str,
     ) -> corbit_client::AgentPromptOptions {
         let supports_turn_options = provider_supports_turn_options(provider);
+        let supports_codex_configuration = provider == "codex";
         corbit_client::AgentPromptOptions {
             model: supports_turn_options
                 .then(|| {
@@ -548,10 +549,16 @@ impl ConnectionView {
                         .map(|model| model.id.clone())
                 })
                 .flatten(),
-            permission_mode: supports_turn_options
-                .then_some(corbit_client::AgentPermissionMode::WorkspaceWrite),
+            permission_mode: supports_turn_options.then_some(self.composer_permission_mode),
             reasoning_effort: supports_turn_options
                 .then(|| self.new_task_reasoning_effort(project_id, provider))
+                .flatten(),
+            network_access: supports_codex_configuration
+                .then_some(self.agent_configuration.network_access),
+            reasoning_summary: supports_codex_configuration
+                .then_some(self.agent_configuration.reasoning_summary),
+            personality: supports_codex_configuration
+                .then_some(self.agent_configuration.personality)
                 .flatten(),
             attachments: Vec::new(),
         }
@@ -1153,7 +1160,7 @@ impl ConnectionView {
                     "Provider 默认".to_owned()
                 }
             },
-            |model| model.display_name.clone(),
+            |model| model_display_name(&model.id, &model.display_name),
         );
         let model_choices =
             self.provider_catalog
@@ -1173,9 +1180,8 @@ impl ConnectionView {
             .outline()
             .small()
             .label(model_label)
-            .dropdown_caret(true)
             .tooltip(if supports_turn_options {
-                "选择首次 Prompt 使用的模型"
+                "选择模型"
             } else {
                 "当前 Provider 使用自己的默认模型"
             })
@@ -1199,22 +1205,12 @@ impl ConnectionView {
                         .is_some_and(|selected| selected.id == model.id);
                     menu = menu.item(
                         PopupMenuItem::element(move |_, _| {
-                            div()
-                                .v_flex()
-                                .min_w_0()
-                                .py_1()
-                                .child(
-                                    div()
-                                        .text_size(font_px(FONT_SIZE_SM))
-                                        .font_medium()
-                                        .child(model.display_name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(font_px(FONT_SIZE_XS))
-                                        .text_color(rgb(COLOR_TEXT_SECONDARY))
-                                        .child(model.description.clone()),
-                                )
+                            div().v_flex().min_w_0().py_1().child(
+                                div()
+                                    .text_size(font_px(FONT_SIZE_SM))
+                                    .font_medium()
+                                    .child(model_display_name(&model.id, &model.display_name)),
+                            )
                         })
                         .checked(checked)
                         .on_click(move |_, _, cx| {
@@ -1244,10 +1240,9 @@ impl ConnectionView {
         let reasoning_button = Button::new("new-task-reasoning")
             .outline()
             .small()
-            .label(reasoning_effort.map_or("默认推理", reasoning_effort_label))
-            .dropdown_caret(true)
+            .label(reasoning_effort.map_or("默认", reasoning_effort_short_label))
             .tooltip(if supports_turn_options {
-                "选择首次 Prompt 的推理程度"
+                "选择推理等级"
             } else {
                 "当前 Provider 管理自己的推理程度"
             })
@@ -1268,24 +1263,12 @@ impl ConnectionView {
                     let item_provider = reasoning_provider.clone();
                     menu = menu.item(
                         PopupMenuItem::element(move |_, _| {
-                            div()
-                                .v_flex()
-                                .min_w_0()
-                                .py_1()
-                                .child(
-                                    div()
-                                        .text_size(font_px(FONT_SIZE_SM))
-                                        .font_medium()
-                                        .child(reasoning_effort_short_label(effort)),
-                                )
-                                .when_some(choice.description.clone(), |item, description| {
-                                    item.child(
-                                        div()
-                                            .text_size(font_px(FONT_SIZE_XS))
-                                            .text_color(rgb(COLOR_TEXT_SECONDARY))
-                                            .child(description),
-                                    )
-                                })
+                            div().v_flex().min_w_0().py_1().child(
+                                div()
+                                    .text_size(font_px(FONT_SIZE_SM))
+                                    .font_medium()
+                                    .child(reasoning_effort_short_label(effort)),
+                            )
                         })
                         .checked(reasoning_effort == Some(effort))
                         .on_click(move |_, _, cx| {
@@ -1830,6 +1813,9 @@ mod tests {
                 model: Some("gpt-5.4".into()),
                 permission_mode: Some(corbit_client::AgentPermissionMode::WorkspaceWrite),
                 reasoning_effort: Some(corbit_client::AgentReasoningEffort::High),
+                network_access: Some(true),
+                reasoning_summary: Some(corbit_client::AgentReasoningSummary::Concise),
+                personality: Some(corbit_client::AgentPersonality::Pragmatic),
                 attachments: Vec::new(),
             }),
             agent_id: Some("agent-1".into()),

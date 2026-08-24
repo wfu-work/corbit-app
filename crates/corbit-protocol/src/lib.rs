@@ -503,123 +503,154 @@ pub struct ProviderReasoningEffortInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PluginRuntime {
-    Builtin,
-    Process,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum PluginPermission {
-    #[serde(rename = "workspace.read")]
-    WorkspaceRead,
-    #[serde(rename = "workspace.write")]
-    WorkspaceWrite,
-    #[serde(rename = "network")]
-    Network,
-    #[serde(rename = "process")]
-    Process,
-    #[serde(rename = "secrets")]
-    Secrets,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PluginCommand {
-    pub id: String,
+pub struct PluginAuthor {
     pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PluginCapabilityUsage {
-    pub capability: String,
-    pub request_count: u32,
-    pub success_count: u32,
-    pub failure_count: u32,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PluginAuditStatus {
-    Succeeded,
-    Failed,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PluginAuditEntry {
-    pub id: String,
-    pub plugin_id: String,
-    pub command_id: String,
-    pub started_at: String,
-    pub completed_at: String,
-    pub status: PluginAuditStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<String>,
-    #[serde(default)]
-    pub capability_usage: Vec<PluginCapabilityUsage>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PluginCommandResult {
-    pub plugin_id: String,
-    pub command_id: String,
-    pub message: String,
-    #[serde(default)]
-    pub capability_usage: Vec<PluginCapabilityUsage>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PluginEntrypoint {
-    pub command: String,
-    pub args: Vec<String>,
+    pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<PluginEntrypointProtocol>,
+    pub url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PluginEntrypointProtocol {
-    Jsonl,
+#[serde(rename_all = "camelCase")]
+pub struct PluginInterface {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_policy_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms_of_service_url: Option<String>,
+    #[serde(default)]
+    pub default_prompt: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
+    #[serde(default)]
+    pub screenshots: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginManifest {
-    pub schema_version: u32,
-    pub id: String,
     pub name: String,
-    pub version: String,
-    pub publisher: String,
-    pub description: String,
-    pub runtime: PluginRuntime,
-    pub api_version: u32,
-    pub permissions: Vec<PluginPermission>,
-    pub entrypoint: Option<PluginEntrypoint>,
-    pub commands: Vec<PluginCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<PluginAuthor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apps: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<PluginInterface>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginComponents {
+    pub skill_count: u32,
+    #[serde(default)]
+    pub skill_names: Vec<String>,
+    #[serde(default)]
+    pub mcp_server_names: Vec<String>,
+    pub has_hooks: bool,
+    pub has_apps: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginProviderCompatibilityStatus {
+    Full,
+    Partial,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
+pub struct PluginProviderCompatibilityEntry {
+    pub status: PluginProviderCompatibilityStatus,
+    pub skills: bool,
+    pub mcp_servers: bool,
+    pub hooks: bool,
+    pub apps: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginProviderCompatibility {
+    pub codex: PluginProviderCompatibilityEntry,
+    pub claude: PluginProviderCompatibilityEntry,
+    pub acp: PluginProviderCompatibilityEntry,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum PluginSource {
+    Local {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    Git {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        r#ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha: Option<String>,
+    },
+    Npm {
+        package: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registry: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginRecord {
+    pub plugin_id: String,
     pub manifest: PluginManifest,
-    pub source: String,
+    pub source: PluginSource,
     pub enabled: bool,
-    #[serde(default)]
-    pub unavailable_permissions: Vec<PluginPermission>,
-    pub installed_path: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PluginSourceKind {
-    Directory,
-    Archive,
+    pub installed_path: String,
+    pub components: PluginComponents,
+    pub provider_compatibility: PluginProviderCompatibility,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -636,40 +667,152 @@ pub struct PluginInspection {
     pub inspection_id: String,
     pub plugin_id: String,
     pub manifest: PluginManifest,
-    pub source_kind: PluginSourceKind,
     #[serde(default)]
     pub operation: PluginInspectionOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
-    #[serde(default)]
-    pub permission_escalation: Vec<PluginPermission>,
-    #[serde(default)]
-    pub unavailable_permissions: Vec<PluginPermission>,
     pub source_fingerprint: String,
     pub expires_at: String,
+    pub components: PluginComponents,
+    pub provider_compatibility: PluginProviderCompatibility,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(clippy::struct_excessive_bools)]
 pub struct PluginMarketplaceEntry {
-    pub manifest: PluginManifest,
+    pub plugin_id: String,
+    pub name: String,
+    pub category: String,
+    pub policy: PluginMarketplacePolicy,
+    pub source: PluginSource,
     pub installed: bool,
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
+    pub compatible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incompatibility_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginMarketplacePolicy {
+    pub installation: PluginInstallationPolicy,
+    pub authentication: PluginAuthenticationPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PluginInstallationPolicy {
+    Available,
+    InstalledByDefault,
+    NotAvailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PluginAuthenticationPolicy {
+    OnInstall,
+    OnFirstUse,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOfficialPluginCatalog {
     #[serde(default)]
-    pub update_available: bool,
+    pub marketplaces: Vec<CodexOfficialPluginMarketplace>,
     #[serde(default)]
-    pub permission_escalation: Vec<PluginPermission>,
+    pub featured_plugin_ids: Vec<String>,
     #[serde(default)]
-    pub unavailable_permissions: Vec<PluginPermission>,
+    pub marketplace_load_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOfficialPluginMarketplace {
+    pub name: String,
+    pub display_name: String,
     #[serde(default)]
-    pub verified: bool,
+    pub plugins: Vec<CodexOfficialPluginSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOfficialPluginSummary {
+    pub id: String,
+    pub name: String,
+    pub installed: bool,
+    pub enabled: bool,
+    pub source_type: String,
+    pub availability: String,
+    pub install_policy: String,
+    pub auth_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_version: Option<String>,
     #[serde(default)]
-    pub package_url: Option<String>,
+    pub keywords: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub must_show_installation_interstitial: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<CodexOfficialPluginInterface>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOfficialPluginInterface {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo_url_dark: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_icon_url: Option<String>,
     #[serde(default)]
-    pub key_id: Option<String>,
+    pub screenshot_urls: Vec<String>,
+    #[serde(default)]
+    pub default_prompt: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_policy_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms_of_service_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOfficialPluginApp {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexOfficialPluginInstallResult {
+    pub auth_policy: String,
+    #[serde(default)]
+    pub apps_needing_auth: Vec<CodexOfficialPluginApp>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -886,6 +1029,25 @@ pub enum AgentReasoningEffort {
     Ultra,
 }
 
+/// Requested reasoning-summary detail for one Provider turn.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
+    None,
+}
+
+/// Requested response personality for one Provider turn.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPersonality {
+    None,
+    Friendly,
+    Pragmatic,
+}
+
 /// One attachment uploaded with an Agent prompt.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -905,8 +1067,151 @@ pub struct AgentPromptOptions {
     pub permission_mode: Option<AgentPermissionMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<AgentReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_access: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<AgentReasoningSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personality: Option<AgentPersonality>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AgentPromptAttachment>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScheduledTaskStatus {
+    Active,
+    Paused,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScheduledRunStatus {
+    Running,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScheduledRunTrigger {
+    Scheduled,
+    Manual,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ScheduledTaskSchedule {
+    Interval {
+        #[serde(rename = "everyMinutes")]
+        every_minutes: u32,
+    },
+    Daily {
+        hour: u8,
+        minute: u8,
+    },
+    Weekly {
+        weekdays: Vec<u8>,
+        hour: u8,
+        minute: u8,
+    },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledPromptOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<AgentPermissionMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<AgentReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_access: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<AgentReasoningSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub personality: Option<AgentPersonality>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTask {
+    pub id: String,
+    pub title: String,
+    pub agent_id: String,
+    pub prompt: String,
+    pub schedule: ScheduledTaskSchedule,
+    pub time_zone: String,
+    pub status: ScheduledTaskStatus,
+    pub prompt_options: ScheduledPromptOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledRun {
+    pub id: String,
+    pub task_id: String,
+    pub agent_id: String,
+    pub trigger: ScheduledRunTrigger,
+    pub scheduled_for: String,
+    pub status: ScheduledRunStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskCreateInput {
+    pub title: String,
+    pub agent_id: String,
+    pub prompt: String,
+    pub schedule: ScheduledTaskSchedule,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_options: Option<ScheduledPromptOptions>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskUpdateInput {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduledTaskSchedule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_options: Option<ScheduledPromptOptions>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledTaskDeleteAcknowledgement {
+    pub task_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -924,6 +1229,17 @@ pub struct AgentPromptAcknowledgement {
 pub struct AgentInterruptAcknowledgement {
     pub agent_id: String,
     pub turn_id: String,
+    pub client_mutation_id: String,
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSteerAcknowledgement {
+    pub agent_id: String,
+    pub turn_id: String,
+    pub text: String,
     pub client_mutation_id: String,
     #[serde(flatten)]
     pub extensions: BTreeMap<String, Value>,
@@ -1050,6 +1366,76 @@ mod tests {
     }
 
     #[test]
+    fn prompt_options_round_trip_codex_configuration() {
+        let options = super::AgentPromptOptions {
+            model: Some("gpt-5.6-sol".into()),
+            permission_mode: Some(super::AgentPermissionMode::WorkspaceWrite),
+            reasoning_effort: Some(super::AgentReasoningEffort::High),
+            network_access: Some(true),
+            reasoning_summary: Some(super::AgentReasoningSummary::Detailed),
+            personality: Some(super::AgentPersonality::Pragmatic),
+            attachments: Vec::new(),
+        };
+
+        let encoded = serde_json::to_value(&options).expect("prompt options should serialize");
+        assert_eq!(encoded["networkAccess"], true);
+        assert_eq!(encoded["reasoningSummary"], "detailed");
+        assert_eq!(encoded["personality"], "pragmatic");
+        assert_eq!(
+            serde_json::from_value::<super::AgentPromptOptions>(encoded)
+                .expect("prompt options should deserialize"),
+            options
+        );
+    }
+
+    #[test]
+    fn scheduled_task_models_match_daemon_camel_case_payloads() {
+        let task: super::ScheduledTask = serde_json::from_value(serde_json::json!({
+            "id": "schedule_1",
+            "title": "Daily brief",
+            "agentId": "agent_1",
+            "prompt": "Summarize changes",
+            "schedule": { "kind": "weekly", "weekdays": [1, 2, 3, 4, 5], "hour": 9, "minute": 0 },
+            "timeZone": "Asia/Shanghai",
+            "status": "active",
+            "promptOptions": { "permissionMode": "read_only" },
+            "nextRunAt": "2026-08-24T01:00:00.000Z",
+            "createdAt": "2026-08-23T00:00:00.000Z",
+            "updatedAt": "2026-08-23T00:00:00.000Z"
+        }))
+        .expect("scheduled task should match the daemon response");
+        assert_eq!(task.status, super::ScheduledTaskStatus::Active);
+        assert_eq!(
+            task.prompt_options.permission_mode,
+            Some(super::AgentPermissionMode::ReadOnly)
+        );
+        assert!(matches!(
+            task.schedule,
+            super::ScheduledTaskSchedule::Weekly { ref weekdays, .. }
+                if weekdays == &[1, 2, 3, 4, 5]
+        ));
+
+        let request = super::ScheduledTaskCreateInput {
+            title: task.title,
+            agent_id: task.agent_id,
+            prompt: task.prompt,
+            schedule: super::ScheduledTaskSchedule::Interval { every_minutes: 30 },
+            time_zone: None,
+            prompt_options: Some(task.prompt_options),
+        };
+        assert_eq!(
+            serde_json::to_value(request).expect("request should encode"),
+            serde_json::json!({
+                "title": "Daily brief",
+                "agentId": "agent_1",
+                "prompt": "Summarize changes",
+                "schedule": { "kind": "interval", "everyMinutes": 30 },
+                "promptOptions": { "permissionMode": "read_only" }
+            })
+        );
+    }
+
+    #[test]
     fn state_snapshot_fixture_has_strongly_typed_resources() {
         let text = std::fs::read_to_string(format!("{FIXTURE_ROOT}/state/snapshot-response.json"))
             .expect("snapshot fixture should be readable");
@@ -1103,226 +1489,197 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn plugin_models_decode_optional_command_descriptions_and_results() {
+    fn codex_plugin_models_decode_components_sources_and_provider_compatibility() {
         let plugin: super::PluginRecord = serde_json::from_value(serde_json::json!({
+            "pluginId": "com.example.insights",
             "manifest": {
-                "schemaVersion": 1,
-                "id": "com.example.insights",
-                "name": "Insights",
+                "name": "com.example.insights",
                 "version": "1.0.0",
-                "publisher": "Example",
-                "description": "Example plugin",
-                "runtime": "process",
-                "apiVersion": 1,
-                "permissions": ["workspace.read"],
-                "entrypoint": { "command": "plugin.js", "args": [] },
-                "commands": [{ "id": "insights.scan", "name": "Scan" }]
+                "description": "Example Codex plugin",
+                "author": { "name": "Example" },
+                "keywords": ["insights"],
+                "skills": "./skills",
+                "mcpServers": "./.mcp.json",
+                "interface": { "displayName": "Insights", "capabilities": [], "defaultPrompt": [], "screenshots": [] }
             },
-            "source": "local",
-            "enabled": true
-        }))
-        .expect("plugin record should match the daemon response");
-        assert!(plugin.unavailable_permissions.is_empty());
-        assert_eq!(plugin.manifest.commands[0].description, None);
-        assert_eq!(
-            plugin
-                .manifest
-                .entrypoint
-                .as_ref()
-                .and_then(|entrypoint| entrypoint.protocol.as_ref()),
-            None
-        );
-
-        let jsonl_entrypoint: super::PluginEntrypoint = serde_json::from_value(serde_json::json!({
-            "command": "plugin.js",
-            "args": [],
-            "protocol": "jsonl"
-        }))
-        .expect("JSONL plugin entrypoints should match the daemon model");
-        assert_eq!(
-            jsonl_entrypoint.protocol,
-            Some(super::PluginEntrypointProtocol::Jsonl)
-        );
-
-        let manifest = serde_json::to_value(&plugin.manifest).expect("manifest should serialize");
-        let current_plugin: super::PluginRecord = serde_json::from_value(serde_json::json!({
-            "manifest": manifest.clone(),
-            "source": "local",
+            "source": { "type": "local" },
             "enabled": true,
-            "unavailablePermissions": ["network"]
+            "installedPath": "/plugins/com.example.insights",
+            "components": {
+                "skillCount": 1,
+                "skillNames": ["scan"],
+                "mcpServerNames": ["insights"],
+                "hasHooks": false,
+                "hasApps": false
+            },
+            "providerCompatibility": compatibility()
         }))
-        .expect("current plugin records should expose unavailable host permissions");
+        .expect("Codex plugin record should match the daemon response");
+
+        assert_eq!(plugin.plugin_id, "com.example.insights");
+        assert_eq!(plugin.manifest.skills.as_deref(), Some("./skills"));
+        assert_eq!(plugin.components.skill_names, ["scan"]);
         assert_eq!(
-            current_plugin.unavailable_permissions,
-            vec![super::PluginPermission::Network]
+            plugin.provider_compatibility.claude.status,
+            super::PluginProviderCompatibilityStatus::Full
         );
+        assert!(matches!(
+            plugin.source,
+            super::PluginSource::Local { path: None }
+        ));
 
         let inspection: super::PluginInspection = serde_json::from_value(serde_json::json!({
             "inspectionId": "inspection_1",
             "pluginId": "com.example.insights",
-            "manifest": manifest.clone(),
-            "sourceKind": "archive",
+            "manifest": plugin.manifest,
+            "operation": "update",
+            "installedVersion": "0.9.0",
             "sourceFingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "expiresAt": "2026-08-22T00:05:00.000Z"
+            "expiresAt": "2026-08-22T00:05:00.000Z",
+            "components": plugin.components,
+            "providerCompatibility": compatibility()
         }))
         .expect("plugin inspection should match the daemon response");
-        assert_eq!(inspection.plugin_id, "com.example.insights");
-        assert_eq!(inspection.source_kind, super::PluginSourceKind::Archive);
         assert_eq!(
             inspection.operation,
-            super::PluginInspectionOperation::Install
-        );
-        assert_eq!(inspection.installed_version, None);
-        assert!(inspection.permission_escalation.is_empty());
-        assert!(inspection.unavailable_permissions.is_empty());
-        assert_eq!(inspection.manifest.commands[0].id, "insights.scan");
-
-        let update_inspection: super::PluginInspection =
-            serde_json::from_value(serde_json::json!({
-                "inspectionId": "inspection_2",
-                "pluginId": "com.example.insights",
-                "manifest": manifest.clone(),
-                "sourceKind": "directory",
-                "operation": "update",
-                "installedVersion": "1.0.0",
-                "permissionEscalation": ["network"],
-                "unavailablePermissions": ["network"],
-                "sourceFingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                "expiresAt": "2026-08-22T00:05:00.000Z"
-            }))
-            .expect("plugin update inspection should match the daemon response");
-        assert_eq!(
-            update_inspection.operation,
             super::PluginInspectionOperation::Update
         );
-        assert_eq!(
-            update_inspection.installed_version.as_deref(),
-            Some("1.0.0")
-        );
-        assert_eq!(
-            update_inspection.permission_escalation,
-            vec![super::PluginPermission::Network]
-        );
-        assert_eq!(
-            update_inspection.unavailable_permissions,
-            vec![super::PluginPermission::Network]
-        );
+        assert_eq!(inspection.installed_version.as_deref(), Some("0.9.0"));
+        assert_eq!(inspection.components.mcp_server_names, ["insights"]);
 
-        let legacy_marketplace: super::PluginMarketplaceEntry =
-            serde_json::from_value(serde_json::json!({
-                "manifest": manifest.clone(),
-                "installed": false,
-                "enabled": false
-            }))
-            .expect("legacy marketplace entries should remain compatible");
-        assert_eq!(legacy_marketplace.installed_version, None);
-        assert!(!legacy_marketplace.update_available);
-        assert!(legacy_marketplace.permission_escalation.is_empty());
-        assert!(legacy_marketplace.unavailable_permissions.is_empty());
-        assert!(!legacy_marketplace.verified);
-        assert_eq!(legacy_marketplace.package_url, None);
-        assert_eq!(legacy_marketplace.key_id, None);
-
-        let verified_marketplace: super::PluginMarketplaceEntry =
-            serde_json::from_value(serde_json::json!({
-                "manifest": manifest,
-                "installed": false,
-                "enabled": false,
-                "verified": true,
-                "packageUrl": "https://plugins.example.test/insights.corbit-plugin",
-                "keyId": "example-publisher"
-            }))
-            .expect("signed marketplace entries should match the daemon response");
-        assert!(verified_marketplace.verified);
-        assert_eq!(
-            verified_marketplace.package_url.as_deref(),
-            Some("https://plugins.example.test/insights.corbit-plugin")
-        );
-        assert_eq!(
-            verified_marketplace.key_id.as_deref(),
-            Some("example-publisher")
-        );
-
-        let update: super::PluginMarketplaceEntry = serde_json::from_value(serde_json::json!({
-            "manifest": manifest,
-            "installed": true,
-            "enabled": false,
-            "installedVersion": "1.0.0",
-            "updateAvailable": true,
-            "permissionEscalation": ["network"],
-            "verified": true
+        let minimal: super::PluginManifest = serde_json::from_value(serde_json::json!({
+            "name": "minimal.plugin"
         }))
-        .expect("plugin marketplace updates should match the daemon response");
-        assert_eq!(update.installed_version.as_deref(), Some("1.0.0"));
-        assert!(update.update_available);
-        assert_eq!(
-            update.permission_escalation,
-            vec![super::PluginPermission::Network]
-        );
-
-        let legacy_result: super::PluginCommandResult = serde_json::from_value(serde_json::json!({
-            "pluginId": "com.example.insights",
-            "commandId": "insights.scan",
-            "message": "legacy"
-        }))
-        .expect("legacy plugin command results should remain compatible");
-        assert!(legacy_result.capability_usage.is_empty());
-
-        let result: super::PluginCommandResult = serde_json::from_value(serde_json::json!({
-            "pluginId": "com.example.insights",
-            "commandId": "insights.scan",
-            "message": "done",
-            "capabilityUsage": [{
-                "capability": "workspace.read",
-                "requestCount": 2,
-                "successCount": 1,
-                "failureCount": 1
-            }]
-        }))
-        .expect("plugin command result should match the daemon response");
-        assert_eq!(result.message, "done");
-        assert_eq!(result.capability_usage[0].request_count, 2);
+        .expect("optional Codex manifest metadata may be omitted");
+        assert_eq!(minimal.name, "minimal.plugin");
+        assert!(minimal.version.is_none());
+        assert!(minimal.description.is_none());
     }
 
     #[test]
-    fn plugin_audit_entries_decode_success_failure_and_capability_usage() {
-        let entries: Vec<super::PluginAuditEntry> = serde_json::from_value(serde_json::json!([
-            {
-                "id": "audit_success",
-                "pluginId": "com.example.insights",
-                "commandId": "insights.scan",
-                "startedAt": "2026-08-22T00:00:00.000Z",
-                "completedAt": "2026-08-22T00:00:01.000Z",
-                "status": "succeeded",
-                "capabilityUsage": [{
-                    "capability": "workspace.read",
-                    "requestCount": 2,
-                    "successCount": 1,
-                    "failureCount": 1
-                }]
-            },
-            {
-                "id": "audit_failure",
-                "pluginId": "com.example.insights",
-                "commandId": "insights.scan",
-                "startedAt": "2026-08-22T00:00:02.000Z",
-                "completedAt": "2026-08-22T00:00:03.000Z",
-                "status": "failed",
-                "errorCode": "plugin_protocol_error"
-            }
-        ]))
-        .expect("plugin audit entries should match the daemon response");
+    fn codex_marketplace_models_decode_local_git_and_npm_sources() {
+        for (source, expected) in [
+            (
+                serde_json::json!({ "type": "local", "path": "./plugins/local" }),
+                "local",
+            ),
+            (
+                serde_json::json!({
+                    "type": "git",
+                    "url": "https://github.com/example/plugins.git",
+                    "path": "./plugins/git",
+                    "ref": "main",
+                    "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }),
+                "git",
+            ),
+            (
+                serde_json::json!({
+                    "type": "npm",
+                    "package": "@example/plugin",
+                    "version": "1.2.3",
+                    "registry": "https://registry.npmjs.org/"
+                }),
+                "npm",
+            ),
+        ] {
+            let entry: super::PluginMarketplaceEntry = serde_json::from_value(serde_json::json!({
+                "pluginId": format!("{expected}.plugin"),
+                "name": format!("{expected}.plugin"),
+                "category": "Developer Tools",
+                "policy": {
+                    "installation": "AVAILABLE",
+                    "authentication": "ON_FIRST_USE"
+                },
+                "source": source,
+                "installed": false,
+                "enabled": false,
+                "compatible": true
+            }))
+            .expect("marketplace source should decode");
+            assert!(entry.compatible);
+            assert_eq!(
+                entry.policy.installation,
+                super::PluginInstallationPolicy::Available
+            );
+        }
+    }
 
-        assert_eq!(entries[0].status, super::PluginAuditStatus::Succeeded);
-        assert_eq!(entries[0].error_code, None);
-        assert_eq!(entries[0].capability_usage[0].failure_count, 1);
-        assert_eq!(entries[1].status, super::PluginAuditStatus::Failed);
+    #[test]
+    fn codex_official_plugin_catalog_decodes_marketplace_policy_and_auth_apps() {
+        let catalog: super::CodexOfficialPluginCatalog =
+            serde_json::from_value(serde_json::json!({
+                "marketplaces": [{
+                    "name": "openai-curated",
+                    "displayName": "Codex official",
+                    "plugins": [{
+                        "id": "plugin_gmail",
+                        "name": "gmail",
+                        "installed": false,
+                        "enabled": false,
+                        "sourceType": "remote",
+                        "availability": "AVAILABLE",
+                        "installPolicy": "AVAILABLE",
+                        "authPolicy": "ON_INSTALL",
+                        "version": "0.1.3",
+                        "keywords": ["gmail", "email"],
+                        "mustShowInstallationInterstitial": true,
+                        "interface": {
+                            "displayName": "Gmail",
+                            "shortDescription": "Read and manage Gmail",
+                            "developerName": "OpenAI",
+                            "category": "Communication",
+                            "brandColor": "#EA4335",
+                            "logoUrl": "https://example.com/gmail.png",
+                            "screenshotUrls": [],
+                            "defaultPrompt": ["Summarize unread Gmail threads"],
+                            "capabilities": ["Interactive", "Write"]
+                        }
+                    }]
+                }],
+                "featuredPluginIds": ["plugin_gmail"],
+                "marketplaceLoadErrors": ["Personal marketplace unavailable"]
+            }))
+            .expect("official Codex catalog should match the daemon response");
+
+        let plugin = &catalog.marketplaces[0].plugins[0];
+        assert_eq!(catalog.featured_plugin_ids, ["plugin_gmail"]);
+        assert_eq!(plugin.source_type, "remote");
+        assert_eq!(plugin.auth_policy, "ON_INSTALL");
         assert_eq!(
-            entries[1].error_code.as_deref(),
-            Some("plugin_protocol_error")
+            plugin
+                .interface
+                .as_ref()
+                .and_then(|interface| interface.display_name.as_deref()),
+            Some("Gmail")
         );
-        assert!(entries[1].capability_usage.is_empty());
+        assert_eq!(catalog.marketplace_load_errors.len(), 1);
+
+        let install: super::CodexOfficialPluginInstallResult =
+            serde_json::from_value(serde_json::json!({
+                "authPolicy": "ON_INSTALL",
+                "appsNeedingAuth": [{
+                    "id": "connector_gmail",
+                    "name": "Gmail",
+                    "description": "Connect Gmail",
+                    "category": "Communication",
+                    "installUrl": "https://chatgpt.com/apps/gmail/connect"
+                }]
+            }))
+            .expect("official Codex install result should include account setup apps");
+        assert_eq!(install.apps_needing_auth[0].name, "Gmail");
+        assert_eq!(
+            install.apps_needing_auth[0].install_url.as_deref(),
+            Some("https://chatgpt.com/apps/gmail/connect")
+        );
+    }
+
+    fn compatibility() -> serde_json::Value {
+        serde_json::json!({
+            "codex": { "status": "full", "skills": true, "mcpServers": true, "hooks": false, "apps": false },
+            "claude": { "status": "full", "skills": true, "mcpServers": true, "hooks": false, "apps": false },
+            "acp": { "status": "full", "skills": true, "mcpServers": true, "hooks": false, "apps": false }
+        })
     }
 
     #[test]

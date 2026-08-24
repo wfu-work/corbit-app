@@ -6,19 +6,15 @@
     {
       "layers" : [
         {
-          "image-name" : "core.svg",
-          "name" : "open core"
-        },
-        {
           "image-name" : "orbit.svg",
-          "name" : "tri-link"
+          "name" : "orbit weave"
         },
         {
           "image-name" : "background.svg",
           "name" : "background"
         }
       ],
-      "name" : "Corbit Flat Mark",
+      "name" : "Corbit Orbit Weave",
       "shadow" : {
         "kind" : "neutral",
         "opacity" : 0

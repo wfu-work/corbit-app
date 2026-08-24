@@ -1,4 +1,13 @@
+use super::settings::settings_page_header;
 use super::*;
+
+pub(super) struct AgentMenuData {
+    pub(super) agent_id: String,
+    pub(super) agent_title: String,
+    pub(super) working_directory: String,
+    pub(super) project_id: String,
+    pub(super) workspace_id: String,
+}
 
 fn sidebar_menu_text(text: impl Into<SharedString>) -> Div {
     div()
@@ -13,6 +22,26 @@ fn sidebar_row_variant(cx: &App) -> ButtonCustomVariant {
         .foreground(rgb(COLOR_TEXT).into())
         .hover(sidebar_row_hover_rgb().into())
         .active(sidebar_row_active_rgb().into())
+}
+
+fn sidebar_task_row_variant(cx: &App) -> ButtonCustomVariant {
+    ButtonCustomVariant::new(cx)
+        .foreground(rgb(COLOR_TEXT_SECONDARY).into())
+        .hover(sidebar_row_hover_rgb().into())
+        .active(sidebar_row_active_rgb().into())
+}
+
+fn settings_sidebar_group_title(title: impl Into<SharedString>) -> Div {
+    div()
+        .px_2()
+        .text_size(font_px(FONT_SIZE_BASE))
+        .font_normal()
+        .text_color(rgb(COLOR_TEXT_SECONDARY))
+        .child(title.into())
+}
+
+fn settings_sidebar_icon(icon: AppIcon) -> Icon {
+    Icon::new(icon).size(px(15.))
 }
 
 fn toggle_sidebar_project_state(collapsed_projects: &mut BTreeSet<String>, project_id: &str) {
@@ -504,7 +533,7 @@ impl ConnectionView {
 
     fn select_workspace_in_settings(&mut self, workspace_id: &str, cx: &mut Context<Self>) {
         self.select_workspace(workspace_id, cx);
-        self.resource_section = ResourceSection::Workspaces;
+        self.resource_section = ResourceSection::Projects;
         self.main_section = MainSection::Resources;
         self.schedule_ui_state_save(cx);
         cx.notify();
@@ -512,10 +541,6 @@ impl ConnectionView {
 
     pub(super) fn select_agent_in_settings(&mut self, agent_id: &str, cx: &mut Context<Self>) {
         self.select_agent(agent_id, cx);
-        self.resource_section = ResourceSection::Agents;
-        self.main_section = MainSection::Resources;
-        self.schedule_ui_state_save(cx);
-        cx.notify();
     }
 
     fn toggle_sidebar_project(&mut self, project_id: &str, cx: &mut Context<Self>) {
@@ -592,6 +617,95 @@ impl ConnectionView {
             )
     }
 
+    pub(super) fn agent_popup_menu(
+        menu: PopupMenu,
+        view: Entity<Self>,
+        data: AgentMenuData,
+        can_mutate: bool,
+    ) -> PopupMenu {
+        let AgentMenuData {
+            agent_id,
+            agent_title,
+            working_directory,
+            project_id,
+            workspace_id,
+        } = data;
+        let rename_view = view.clone();
+        let rename_agent_id = agent_id.clone();
+        let rename_agent_title = agent_title;
+        let reveal_view = view.clone();
+        let reveal_directory = working_directory.clone();
+        let copy_directory_view = view.clone();
+        let copy_directory = working_directory;
+        let copy_id_view = view.clone();
+        let copy_agent_id = agent_id.clone();
+        let new_window_view = view;
+
+        menu.min_w(px(210.))
+            .item(
+                PopupMenuItem::new("重命名任务")
+                    .icon(Icon::new(AppIcon::Rename))
+                    .disabled(!can_mutate)
+                    .on_click(move |_, window, cx| {
+                        Self::open_agent_rename_dialog(
+                            rename_view.clone(),
+                            rename_agent_id.clone(),
+                            rename_agent_title.clone(),
+                            window,
+                            cx,
+                        );
+                    }),
+            )
+            .item(PopupMenuItem::separator())
+            .item(
+                PopupMenuItem::new(file_manager_reveal_label())
+                    .icon(Icon::new(AppIcon::FolderOpen))
+                    .on_click(move |_, _, cx| {
+                        let result = reveal_working_directory(&reveal_directory);
+                        reveal_view.update(cx, |view, cx| match result {
+                            Ok(()) => {
+                                view.show_success("已在文件管理器中显示工作目录", cx);
+                            }
+                            Err(error) => view.show_error(error, cx),
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("复制工作目录")
+                    .icon(Icon::new(AppIcon::Copy))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_directory.clone()));
+                        copy_directory_view.update(cx, |view, cx| {
+                            view.show_success("已复制工作目录", cx);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("复制会话 ID")
+                    .icon(Icon::new(AppIcon::Copy))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_agent_id.clone()));
+                        copy_id_view.update(cx, |view, cx| {
+                            view.show_success("已复制会话 ID", cx);
+                        });
+                    }),
+            )
+            .item(PopupMenuItem::separator())
+            .item(
+                PopupMenuItem::new("在新窗口中打开")
+                    .icon(Icon::new(AppIcon::ExternalLink))
+                    .on_click(move |_, _, cx| {
+                        Self::open_agent_in_new_window(
+                            &new_window_view,
+                            project_id.clone(),
+                            workspace_id.clone(),
+                            agent_id.clone(),
+                            cx,
+                        );
+                    }),
+            )
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn render_sidebar(
         &self,
@@ -646,7 +760,7 @@ impl ConnectionView {
                                 let menu_view = sidebar_view.clone();
 
                                 Button::new(("sidebar-agent", agent_index))
-                                    .custom(sidebar_row_variant(cx))
+                                    .custom(sidebar_task_row_variant(cx))
                                     .small()
                                     .rounded(px(8.))
                                     .h(navigation_row_height())
@@ -654,7 +768,7 @@ impl ConnectionView {
                                     .pl_8()
                                     .pr_3()
                                     .justify_start()
-                                    .text_color(rgb(COLOR_TEXT))
+                                    .text_color(rgb(COLOR_TEXT_SECONDARY))
                                     .selected(self.selected_agent_id.as_ref() == Some(&agent.id))
                                     .child(sidebar_menu_text(agent_title.clone()))
                                     .tooltip(agent_title)
@@ -663,86 +777,17 @@ impl ConnectionView {
                                         view.select_agent(&agent_id, cx);
                                     }))
                                     .context_menu(move |menu, _, _| {
-                                        let rename_view = menu_view.clone();
-                                        let rename_agent_id = menu_agent_id.clone();
-                                        let rename_agent_title = menu_agent_title.clone();
-                                        let reveal_view = menu_view.clone();
-                                        let reveal_directory = working_directory.clone();
-                                        let copy_directory_view = menu_view.clone();
-                                        let copy_directory = working_directory.clone();
-                                        let copy_id_view = menu_view.clone();
-                                        let copy_agent_id = menu_agent_id.clone();
-                                        let new_window_view = menu_view.clone();
-                                        let new_window_agent_id = menu_agent_id.clone();
-                                        let new_window_workspace_id = menu_workspace_id.clone();
-                                        let new_window_project_id = menu_project_id.clone();
-
-                                        menu.item(
-                                            PopupMenuItem::new("重命名任务")
-                                                .disabled(!can_mutate)
-                                                .on_click(move |_, window, cx| {
-                                                    Self::open_agent_rename_dialog(
-                                                        rename_view.clone(),
-                                                        rename_agent_id.clone(),
-                                                        rename_agent_title.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }),
-                                        )
-                                        .item(PopupMenuItem::separator())
-                                        .item(
-                                            PopupMenuItem::new(file_manager_reveal_label())
-                                                .on_click(move |_, _, cx| {
-                                                    let result =
-                                                        reveal_working_directory(&reveal_directory);
-                                                    reveal_view.update(
-                                                        cx,
-                                                        |view, cx| match result {
-                                                            Ok(()) => view.show_success(
-                                                                "已在文件管理器中显示工作目录",
-                                                                cx,
-                                                            ),
-                                                            Err(error) => {
-                                                                view.show_error(error, cx);
-                                                            }
-                                                        },
-                                                    );
-                                                }),
-                                        )
-                                        .item(PopupMenuItem::new("复制工作目录").on_click(
-                                            move |_, _, cx| {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    copy_directory.clone(),
-                                                ));
-                                                copy_directory_view.update(cx, |view, cx| {
-                                                    view.show_success("已复制工作目录", cx);
-                                                });
+                                        Self::agent_popup_menu(
+                                            menu,
+                                            menu_view.clone(),
+                                            AgentMenuData {
+                                                agent_id: menu_agent_id.clone(),
+                                                agent_title: menu_agent_title.clone(),
+                                                working_directory: working_directory.clone(),
+                                                project_id: menu_project_id.clone(),
+                                                workspace_id: menu_workspace_id.clone(),
                                             },
-                                        ))
-                                        .item(PopupMenuItem::new("复制会话 ID").on_click(
-                                            move |_, _, cx| {
-                                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                                    copy_agent_id.clone(),
-                                                ));
-                                                copy_id_view.update(cx, |view, cx| {
-                                                    view.show_success("已复制会话 ID", cx);
-                                                });
-                                            },
-                                        ))
-                                        .item(PopupMenuItem::separator())
-                                        .item(
-                                            PopupMenuItem::new("在新窗口中打开").on_click(
-                                                move |_, _, cx| {
-                                                    Self::open_agent_in_new_window(
-                                                        &new_window_view,
-                                                        new_window_project_id.clone(),
-                                                        new_window_workspace_id.clone(),
-                                                        new_window_agent_id.clone(),
-                                                        cx,
-                                                    );
-                                                },
-                                            ),
+                                            can_mutate,
                                         )
                                     })
                             })
@@ -942,6 +987,21 @@ impl ConnectionView {
                                     })),
                             )
                             .child(
+                                Button::new("sidebar-scheduled")
+                                    .ghost()
+                                    .small()
+                                    .h(navigation_row_height())
+                                    .w_full()
+                                    .justify_start()
+                                    .selected(self.main_section == MainSection::Scheduled)
+                                    .icon(Icon::new(AppIcon::Scheduled))
+                                    .child(sidebar_menu_text("已安排"))
+                                    .disabled(!is_online)
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.set_main_section(MainSection::Scheduled, cx);
+                                    })),
+                            )
+                            .child(
                                 Button::new("sidebar-activity")
                                     .ghost()
                                     .small()
@@ -990,6 +1050,7 @@ impl ConnectionView {
                             .child(
                                 div()
                                     .h_flex()
+                                    .group("sidebar-projects-heading")
                                     .items_center()
                                     .pl_2()
                                     .pr_1()
@@ -1006,6 +1067,11 @@ impl ConnectionView {
                                         Button::new("sidebar-add-project")
                                             .ghost()
                                             .small()
+                                            .invisible()
+                                            .group_hover(
+                                                "sidebar-projects-heading",
+                                                gpui::Styled::visible,
+                                            )
                                             .icon(Icon::new(AppIcon::Add))
                                             .tooltip(if is_online {
                                                 "新建项目"
@@ -1929,7 +1995,7 @@ impl ConnectionView {
             .iter()
             .any(|(candidate, _, _)| *candidate == provider)
         {
-            self.show_validation_error("所选模型提供商当前不可用", cx);
+            self.show_validation_error("所选提供商当前不可用", cx);
             return;
         }
         self.run_mutation(
@@ -2155,11 +2221,7 @@ impl ConnectionView {
                     .text_color(rgb(COLOR_TEXT_SECONDARY))
                     .child(format!("已选择：{}", project.name)),
             )
-            .child(
-                Input::new(&self.project_new_name)
-                    .small()
-                    .disabled(!can_mutate),
-            )
+            .child(settings_input(&self.project_new_name).disabled(!can_mutate))
             .child(
                 div()
                     .h_flex()
@@ -2222,11 +2284,7 @@ impl ConnectionView {
                     .text_color(rgb(COLOR_TEXT_SECONDARY))
                     .child(format!("目录：{}", workspace.working_directory)),
             )
-            .child(
-                Input::new(&self.workspace_new_name)
-                    .small()
-                    .disabled(!can_mutate),
-            )
+            .child(settings_input(&self.workspace_new_name).disabled(!can_mutate))
             .child(
                 div()
                     .h_flex()
@@ -2302,13 +2360,9 @@ impl ConnectionView {
             .child(
                 div()
                     .text_color(rgb(COLOR_TEXT_SECONDARY))
-                    .child(format!("模型提供商：{}", agent.provider)),
+                    .child(format!("提供商：{}", agent.provider)),
             )
-            .child(
-                Input::new(&self.agent_new_title)
-                    .small()
-                    .disabled(!can_mutate),
-            )
+            .child(settings_input(&self.agent_new_title).disabled(!can_mutate))
             .child(
                 div()
                     .h_flex()
@@ -2541,26 +2595,12 @@ impl ConnectionView {
             .as_ref()
             .is_some_and(|workspace| workspace.status == corbit_client::WorkspaceStatus::Active);
 
-        let project_panel = div()
-            .v_flex()
-            .w_full()
-            .gap_4()
+        let project_panel = settings_card("项目")
             .child(
                 div()
-                    .v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(font_px(FONT_SIZE_HEADING))
-                            .font_semibold()
-                            .child("项目"),
-                    )
-                    .child(
-                        div()
-                            .text_size(font_px(FONT_SIZE_SM))
-                            .text_color(rgb(COLOR_TEXT_SECONDARY))
-                            .child("项目定义代码根目录，可包含多个工作区。"),
-                    ),
+                    .text_size(font_px(FONT_SIZE_XS))
+                    .text_color(rgb(COLOR_TEXT_TERTIARY))
+                    .child("项目定义代码根目录，可包含多个工作区。"),
             )
             .when(snapshot.projects.is_empty(), |panel| {
                 panel.child(
@@ -2570,16 +2610,10 @@ impl ConnectionView {
                 )
             })
             .children(project_rows)
-            .child(Input::new(&self.project_name).small().disabled(!can_mutate))
+            .child(settings_input(&self.project_name).disabled(!can_mutate))
+            .child(settings_input(&self.project_root_path).disabled(!can_mutate))
             .child(
-                Input::new(&self.project_root_path)
-                    .small()
-                    .disabled(!can_mutate),
-            )
-            .child(
-                Button::new("create-project")
-                    .primary()
-                    .small()
+                settings_primary_action_button("create-project", cx)
                     .label("创建项目")
                     .loading(self.operation_in_flight)
                     .disabled(!can_mutate)
@@ -2587,26 +2621,12 @@ impl ConnectionView {
             )
             .children(project_editor);
 
-        let workspace_panel = div()
-            .v_flex()
-            .w_full()
-            .gap_4()
+        let workspace_panel = settings_card("工作区")
             .child(
                 div()
-                    .v_flex()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_size(font_px(FONT_SIZE_HEADING))
-                            .font_semibold()
-                            .child("工作区"),
-                    )
-                    .child(
-                        div()
-                            .text_size(font_px(FONT_SIZE_SM))
-                            .text_color(rgb(COLOR_TEXT_SECONDARY))
-                            .child("为任务选择实际工作目录，并管理归档状态。"),
-                    ),
+                    .text_size(font_px(FONT_SIZE_XS))
+                    .text_color(rgb(COLOR_TEXT_TERTIARY))
+                    .child("为当前项目管理实际工作目录及归档状态。"),
             )
             .when(selected_project_id.is_none(), |panel| {
                 panel.child(
@@ -2627,19 +2647,15 @@ impl ConnectionView {
             )
             .children(workspace_rows)
             .child(
-                Input::new(&self.workspace_name)
-                    .small()
+                settings_input(&self.workspace_name)
                     .disabled(!can_mutate || selected_project_id.is_none()),
             )
             .child(
-                Input::new(&self.workspace_directory)
-                    .small()
+                settings_input(&self.workspace_directory)
                     .disabled(!can_mutate || selected_project_id.is_none()),
             )
             .child(
-                Button::new("create-workspace")
-                    .primary()
-                    .small()
+                settings_primary_action_button("create-workspace", cx)
                     .label("创建工作区")
                     .loading(self.operation_in_flight)
                     .disabled(!can_mutate || selected_project_id.is_none())
@@ -2702,8 +2718,7 @@ impl ConnectionView {
                 ),
             ))
             .child(
-                Input::new(&self.agent_title)
-                    .small()
+                settings_input(&self.agent_title)
                     .disabled(!can_mutate || !selected_workspace_is_active),
             )
             .child(
@@ -2728,16 +2743,30 @@ impl ConnectionView {
             .children(agent_editor);
 
         let selected_panel = match self.resource_section {
-            ResourceSection::General => self.render_general_settings(is_online, cx),
+            ResourceSection::General => self.render_general_settings(cx),
             ResourceSection::Appearance => self.render_appearance_settings(cx),
+            ResourceSection::Notifications => self.render_notification_settings(cx),
+            ResourceSection::Configuration => self.render_configuration_settings(cx),
             ResourceSection::Providers => self.render_provider_settings(cx),
+            ResourceSection::ComputerControl => self.render_computer_control_settings(cx),
+            ResourceSection::AppSnapshot => self.render_app_snapshot_settings(cx),
             ResourceSection::Plugins => self.render_plugin_settings(is_online, cx),
+            ResourceSection::Browser => self.render_browser_integration_settings(cx),
             ResourceSection::Shortcuts => Self::render_shortcut_settings(),
-            ResourceSection::Projects => project_panel,
-            ResourceSection::Workspaces => workspace_panel,
+            ResourceSection::Projects | ResourceSection::Workspaces => settings_page_header(
+                "项目",
+                "集中管理代码项目及其工作区；任务运行实例会在新建任务时自动创建。",
+            )
+            .child(project_panel)
+            .child(workspace_panel),
+            ResourceSection::SshConnections => self.render_ssh_connection_settings(cx),
+            ResourceSection::Git => self.render_git_settings(cx),
+            ResourceSection::Hooks => self.render_hook_settings(cx),
             ResourceSection::Agents => agent_panel,
+            ResourceSection::Daemon => self.render_daemon_settings(is_online, cx),
             ResourceSection::Devices => self.render_device_settings(is_online, cx),
-            ResourceSection::About => Self::render_about_settings(),
+            ResourceSection::About => self.render_about_settings(cx),
+            ResourceSection::ThirdPartyLicenses => Self::render_third_party_license_settings(),
         };
 
         div()
@@ -2763,6 +2792,7 @@ impl ConnectionView {
                             .px_2()
                             .pt(px(TOOLBAR_HEIGHT))
                             .pb_4()
+                            .overflow_y_scrollbar()
                             .child(
                                 Button::new("settings-back")
                                     .ghost()
@@ -2770,24 +2800,18 @@ impl ConnectionView {
                                     .h(navigation_row_height())
                                     .w_full()
                                     .justify_start()
+                                    .text_color(rgb(COLOR_TEXT_SECONDARY))
                                     .icon(Icon::new(AppIcon::Back))
-                                    .label("返回应用")
+                                    .child(sidebar_menu_text("返回应用"))
                                     .on_click(cx.listener(|view, _, _, cx| {
                                         view.close_settings(cx);
                                     })),
                             )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .text_size(font_px(FONT_SIZE_SM))
-                                    .font_medium()
-                                    .text_color(rgb(COLOR_TEXT_SECONDARY))
-                                    .child("偏好设置"),
-                            )
+                            .child(settings_sidebar_group_title("偏好设置").mt_4())
                             .child(
                                 div()
                                     .v_flex()
-                                    .gap_1()
+                                    .gap(px(1.))
                                     .child(
                                         Button::new("settings-general")
                                             .ghost()
@@ -2798,8 +2822,8 @@ impl ConnectionView {
                                             .selected(
                                                 self.resource_section == ResourceSection::General,
                                             )
-                                            .icon(Icon::new(AppIcon::Settings))
-                                            .label("常规")
+                                            .child(settings_sidebar_icon(AppIcon::Settings))
+                                            .child(sidebar_menu_text("常规"))
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.set_resource_section(
                                                     ResourceSection::General,
@@ -2818,11 +2842,51 @@ impl ConnectionView {
                                                 self.resource_section
                                                     == ResourceSection::Appearance,
                                             )
-                                            .icon(Icon::new(AppIcon::Appearance))
-                                            .label("外观")
+                                            .child(settings_sidebar_icon(AppIcon::Appearance))
+                                            .child(sidebar_menu_text("外观"))
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.set_resource_section(
                                                     ResourceSection::Appearance,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("settings-notifications")
+                                            .ghost()
+                                            .small()
+                                            .h(navigation_row_height())
+                                            .w_full()
+                                            .justify_start()
+                                            .selected(
+                                                self.resource_section
+                                                    == ResourceSection::Notifications,
+                                            )
+                                            .child(settings_sidebar_icon(AppIcon::Notification))
+                                            .child(sidebar_menu_text("通知"))
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.set_resource_section(
+                                                    ResourceSection::Notifications,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("settings-configuration")
+                                            .ghost()
+                                            .small()
+                                            .h(navigation_row_height())
+                                            .w_full()
+                                            .justify_start()
+                                            .selected(
+                                                self.resource_section
+                                                    == ResourceSection::Configuration,
+                                            )
+                                            .child(settings_sidebar_icon(AppIcon::Approval))
+                                            .child(sidebar_menu_text("配置"))
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.set_resource_section(
+                                                    ResourceSection::Configuration,
                                                     cx,
                                                 );
                                             })),
@@ -2837,30 +2901,11 @@ impl ConnectionView {
                                             .selected(
                                                 self.resource_section == ResourceSection::Providers,
                                             )
-                                            .icon(Icon::new(AppIcon::Provider))
-                                            .label("模型提供商")
+                                            .child(settings_sidebar_icon(AppIcon::Provider))
+                                            .child(sidebar_menu_text("提供商"))
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.set_resource_section(
                                                     ResourceSection::Providers,
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("settings-plugins")
-                                            .ghost()
-                                            .small()
-                                            .h(navigation_row_height())
-                                            .w_full()
-                                            .justify_start()
-                                            .selected(
-                                                self.resource_section == ResourceSection::Plugins,
-                                            )
-                                            .icon(Icon::new(AppIcon::Tool))
-                                            .label("插件")
-                                            .on_click(cx.listener(|view, _, _, cx| {
-                                                view.set_resource_section(
-                                                    ResourceSection::Plugins,
                                                     cx,
                                                 );
                                             })),
@@ -2875,8 +2920,8 @@ impl ConnectionView {
                                             .selected(
                                                 self.resource_section == ResourceSection::Shortcuts,
                                             )
-                                            .icon(Icon::new(AppIcon::Shortcuts))
-                                            .label("快捷键")
+                                            .child(settings_sidebar_icon(AppIcon::Shortcuts))
+                                            .child(sidebar_menu_text("快捷键"))
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.set_resource_section(
                                                     ResourceSection::Shortcuts,
@@ -2885,18 +2930,95 @@ impl ConnectionView {
                                             })),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .text_size(font_px(FONT_SIZE_SM))
-                                    .font_medium()
-                                    .text_color(rgb(COLOR_TEXT_SECONDARY))
-                                    .child("工作区"),
-                            )
+                            .child(settings_sidebar_group_title("集成").mt_2())
                             .child(
                                 div()
                                     .v_flex()
-                                    .gap_1()
+                                    .gap(px(1.))
+                                    .child(
+                                        Button::new("settings-computer-control")
+                                            .ghost()
+                                            .small()
+                                            .h(navigation_row_height())
+                                            .w_full()
+                                            .justify_start()
+                                            .selected(
+                                                self.resource_section
+                                                    == ResourceSection::ComputerControl,
+                                            )
+                                            .child(settings_sidebar_icon(AppIcon::ComputerControl))
+                                            .child(sidebar_menu_text("电脑操控"))
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.set_resource_section(
+                                                    ResourceSection::ComputerControl,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("settings-app-snapshot")
+                                            .ghost()
+                                            .small()
+                                            .h(navigation_row_height())
+                                            .w_full()
+                                            .justify_start()
+                                            .selected(
+                                                self.resource_section
+                                                    == ResourceSection::AppSnapshot,
+                                            )
+                                            .child(settings_sidebar_icon(AppIcon::Snapshot))
+                                            .child(sidebar_menu_text("应用快照"))
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.set_resource_section(
+                                                    ResourceSection::AppSnapshot,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("settings-plugins")
+                                            .ghost()
+                                            .small()
+                                            .h(navigation_row_height())
+                                            .w_full()
+                                            .justify_start()
+                                            .selected(
+                                                self.resource_section == ResourceSection::Plugins,
+                                            )
+                                            .child(settings_sidebar_icon(AppIcon::Tool))
+                                            .child(sidebar_menu_text("插件"))
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.set_resource_section(
+                                                    ResourceSection::Plugins,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("settings-browser-integration")
+                                            .ghost()
+                                            .small()
+                                            .h(navigation_row_height())
+                                            .w_full()
+                                            .justify_start()
+                                            .selected(
+                                                self.resource_section == ResourceSection::Browser,
+                                            )
+                                            .child(settings_sidebar_icon(AppIcon::SshConnection))
+                                            .child(sidebar_menu_text("浏览器连接"))
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.set_resource_section(
+                                                    ResourceSection::Browser,
+                                                    cx,
+                                                );
+                                            })),
+                                    ),
+                            )
+                            .child(settings_sidebar_group_title("编码").mt_2())
+                            .child(
+                                div()
+                                    .v_flex()
+                                    .gap(px(1.))
                                     .child(
                                         Button::new("settings-projects")
                                             .ghost()
@@ -2907,8 +3029,8 @@ impl ConnectionView {
                                             .selected(
                                                 self.resource_section == ResourceSection::Projects,
                                             )
-                                            .icon(Icon::new(AppIcon::Project))
-                                            .label("项目")
+                                            .child(settings_sidebar_icon(AppIcon::Project))
+                                            .child(sidebar_menu_text("项目"))
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.set_resource_section(
                                                     ResourceSection::Projects,
@@ -2917,7 +3039,7 @@ impl ConnectionView {
                                             })),
                                     )
                                     .child(
-                                        Button::new("settings-workspaces")
+                                        Button::new("settings-ssh-connections")
                                             .ghost()
                                             .small()
                                             .h(navigation_row_height())
@@ -2925,49 +3047,75 @@ impl ConnectionView {
                                             .justify_start()
                                             .selected(
                                                 self.resource_section
-                                                    == ResourceSection::Workspaces,
+                                                    == ResourceSection::SshConnections,
                                             )
-                                            .icon(Icon::new(AppIcon::Workspace))
-                                            .label("工作区")
+                                            .child(settings_sidebar_icon(AppIcon::SshConnection))
+                                            .child(sidebar_menu_text("连接"))
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.set_resource_section(
-                                                    ResourceSection::Workspaces,
+                                                    ResourceSection::SshConnections,
                                                     cx,
                                                 );
                                             })),
                                     )
                                     .child(
-                                        Button::new("settings-agents")
+                                        Button::new("settings-git")
+                                            .ghost()
+                                            .small()
+                                            .h(navigation_row_height())
+                                            .w_full()
+                                            .justify_start()
+                                            .selected(self.resource_section == ResourceSection::Git)
+                                            .child(settings_sidebar_icon(AppIcon::Git))
+                                            .child(sidebar_menu_text("Git"))
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.set_resource_section(ResourceSection::Git, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("settings-hooks")
                                             .ghost()
                                             .small()
                                             .h(navigation_row_height())
                                             .w_full()
                                             .justify_start()
                                             .selected(
-                                                self.resource_section == ResourceSection::Agents,
+                                                self.resource_section == ResourceSection::Hooks,
                                             )
-                                            .icon(Icon::new(AppIcon::Agent))
-                                            .label("Agent")
+                                            .child(settings_sidebar_icon(AppIcon::Hook))
+                                            .child(sidebar_menu_text("钩子"))
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.set_resource_section(
-                                                    ResourceSection::Agents,
+                                                    ResourceSection::Hooks,
                                                     cx,
                                                 );
                                             })),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .text_size(font_px(FONT_SIZE_SM))
-                                    .font_medium()
-                                    .text_color(rgb(COLOR_TEXT_SECONDARY))
-                                    .child("连接"),
-                            )
+                            .child(settings_sidebar_group_title("服务与设备").mt_2())
                             .child(
                                 div()
                                     .v_flex()
-                                    .gap_1()
+                                    .gap(px(1.))
+                                    .child(
+                                        Button::new("settings-daemon")
+                                            .ghost()
+                                            .small()
+                                            .h(navigation_row_height())
+                                            .w_full()
+                                            .justify_start()
+                                            .selected(
+                                                self.resource_section == ResourceSection::Daemon,
+                                            )
+                                            .child(settings_sidebar_icon(AppIcon::Terminal))
+                                            .child(sidebar_menu_text("本地服务"))
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.set_resource_section(
+                                                    ResourceSection::Daemon,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
                                     .child(
                                         Button::new("settings-devices")
                                             .ghost()
@@ -2978,15 +3126,21 @@ impl ConnectionView {
                                             .selected(
                                                 self.resource_section == ResourceSection::Devices,
                                             )
-                                            .icon(Icon::new(AppIcon::Device))
-                                            .label("设备")
+                                            .child(settings_sidebar_icon(AppIcon::Device))
+                                            .child(sidebar_menu_text("远程设备"))
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.set_resource_section(
                                                     ResourceSection::Devices,
                                                     cx,
                                                 );
                                             })),
-                                    )
+                                    ),
+                            )
+                            .child(settings_sidebar_group_title("关于").mt_2())
+                            .child(
+                                div()
+                                    .v_flex()
+                                    .gap(px(1.))
                                     .child(
                                         Button::new("settings-about")
                                             .ghost()
@@ -2997,11 +3151,31 @@ impl ConnectionView {
                                             .selected(
                                                 self.resource_section == ResourceSection::About,
                                             )
-                                            .icon(Icon::new(AppIcon::Info))
-                                            .label("关于 Corbit")
+                                            .child(settings_sidebar_icon(AppIcon::Info))
+                                            .child(sidebar_menu_text("关于软件"))
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.set_resource_section(
                                                     ResourceSection::About,
+                                                    cx,
+                                                );
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("settings-third-party-licenses")
+                                            .ghost()
+                                            .small()
+                                            .h(navigation_row_height())
+                                            .w_full()
+                                            .justify_start()
+                                            .selected(
+                                                self.resource_section
+                                                    == ResourceSection::ThirdPartyLicenses,
+                                            )
+                                            .child(settings_sidebar_icon(AppIcon::File))
+                                            .child(sidebar_menu_text("开源许可"))
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.set_resource_section(
+                                                    ResourceSection::ThirdPartyLicenses,
                                                     cx,
                                                 );
                                             })),

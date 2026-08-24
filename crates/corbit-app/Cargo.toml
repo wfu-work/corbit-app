@@ -22,6 +22,8 @@ uuid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSObject", "NSString", "NSUserNotification"] }
 security-framework = "3.7.0"
 security-framework-sys = "2.17.0"
 tray-icon = { version = "0.24.2", default-features = false }

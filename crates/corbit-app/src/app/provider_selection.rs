@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct ComposerSelections {
+    defaults: ScopedSelections,
     agents: BTreeMap<String, ScopedSelections>,
     projects: BTreeMap<String, ScopedSelections>,
 }
@@ -33,6 +34,31 @@ struct ProviderSelection {
 }
 
 impl ComposerSelections {
+    pub(super) fn default_model<'a>(
+        &self,
+        provider: &'a ProviderCatalogEntry,
+    ) -> Option<&'a ProviderModelInfo> {
+        let selected = self
+            .defaults
+            .providers
+            .get(&provider.provider_id)
+            .and_then(|selection| selection.model.as_deref());
+        resolve_model(provider, selected)
+    }
+
+    pub(super) fn default_reasoning_effort(
+        &self,
+        provider: &ProviderCatalogEntry,
+    ) -> Option<AgentReasoningEffort> {
+        let model = self.default_model(provider)?;
+        let selected = self
+            .defaults
+            .providers
+            .get(&provider.provider_id)
+            .and_then(|selection| selection.reasoning_effort);
+        resolve_reasoning_effort(model, selected)
+    }
+
     pub(super) fn model<'a>(
         &self,
         agent_id: &str,
@@ -69,7 +95,13 @@ impl ComposerSelections {
             .projects
             .get(project_id)
             .and_then(|project| project.providers.get(&provider.provider_id))
-            .and_then(|selection| selection.model.as_deref());
+            .and_then(|selection| selection.model.as_deref())
+            .or_else(|| {
+                self.defaults
+                    .providers
+                    .get(&provider.provider_id)
+                    .and_then(|selection| selection.model.as_deref())
+            });
         resolve_model(provider, selected)
     }
 
@@ -83,8 +115,54 @@ impl ComposerSelections {
             .projects
             .get(project_id)
             .and_then(|project| project.providers.get(&provider.provider_id))
-            .and_then(|selection| selection.reasoning_effort);
+            .and_then(|selection| selection.reasoning_effort)
+            .or_else(|| {
+                self.defaults
+                    .providers
+                    .get(&provider.provider_id)
+                    .and_then(|selection| selection.reasoning_effort)
+            });
         resolve_reasoning_effort(model, selected)
+    }
+
+    pub(super) fn choose_default_model(
+        &mut self,
+        provider: &ProviderCatalogEntry,
+        model_id: &str,
+    ) -> bool {
+        if !provider.models.iter().any(|model| model.id == model_id) {
+            return false;
+        }
+        let selection = self
+            .defaults
+            .providers
+            .entry(provider.provider_id.clone())
+            .or_default();
+        let before = selection.clone();
+        selection.model = Some(model_id.to_owned());
+        reconcile_selection(selection, provider);
+        *selection != before
+    }
+
+    pub(super) fn choose_default_reasoning_effort(
+        &mut self,
+        provider: &ProviderCatalogEntry,
+        effort: AgentReasoningEffort,
+    ) -> bool {
+        let selection = self
+            .defaults
+            .providers
+            .entry(provider.provider_id.clone())
+            .or_default();
+        reconcile_selection(selection, provider);
+        let Some(model) = resolve_model(provider, selection.model.as_deref()) else {
+            return false;
+        };
+        if !model_supports_effort(model, effort) || selection.reasoning_effort == Some(effort) {
+            return false;
+        }
+        selection.reasoning_effort = Some(effort);
+        true
     }
 
     pub(super) fn choose_model(
@@ -158,6 +236,16 @@ impl ComposerSelections {
         true
     }
 
+    pub(super) fn project_has_overrides(&self, project_id: &str) -> bool {
+        self.projects
+            .get(project_id)
+            .is_some_and(|selections| !selections.providers.is_empty())
+    }
+
+    pub(super) fn clear_project(&mut self, project_id: &str) -> bool {
+        self.projects.remove(project_id).is_some()
+    }
+
     /// Records the frozen new-task selection on the newly created Agent. The
     /// catalog reconciliation below repairs a model that disappeared while the
     /// create/start RPC sequence was in flight.
@@ -199,6 +287,17 @@ impl ComposerSelections {
             .filter(|provider| provider.available)
             .map(|provider| (provider.provider_id.as_str(), provider))
             .collect::<BTreeMap<_, _>>();
+
+        self.defaults.providers.retain(|provider_id, selection| {
+            let Some(provider) = available_providers.get(provider_id.as_str()) else {
+                return false;
+            };
+            if provider.models.is_empty() {
+                return false;
+            }
+            reconcile_selection(selection, provider);
+            true
+        });
 
         reconcile_scoped_selections(&mut self.agents, &agent_ids, &available_providers);
         reconcile_scoped_selections(&mut self.projects, &project_ids, &available_providers);
@@ -369,6 +468,37 @@ mod tests {
     }
 
     #[test]
+    fn clearing_project_restores_global_defaults() {
+        let provider = provider(vec![
+            model(
+                "gpt-default",
+                true,
+                AgentReasoningEffort::Medium,
+                &[AgentReasoningEffort::Medium],
+            ),
+            model(
+                "gpt-project",
+                false,
+                AgentReasoningEffort::High,
+                &[AgentReasoningEffort::High],
+            ),
+        ]);
+        let mut selections = ComposerSelections::default();
+        assert!(selections.choose_default_model(&provider, "gpt-default"));
+        assert!(selections.choose_project_model("project-1", &provider, "gpt-project"));
+        assert!(selections.project_has_overrides("project-1"));
+
+        assert!(selections.clear_project("project-1"));
+        assert!(!selections.project_has_overrides("project-1"));
+        assert_eq!(
+            selections
+                .project_model("project-1", &provider)
+                .map(|model| model.id.as_str()),
+            Some("gpt-default")
+        );
+    }
+
+    #[test]
     fn selections_are_isolated_per_agent() {
         let provider = provider(vec![
             model(
@@ -472,6 +602,50 @@ mod tests {
                 .project_model("project-2", &provider)
                 .map(|model| model.id.as_str()),
             Some("gpt-default")
+        );
+    }
+
+    #[test]
+    fn global_defaults_seed_projects_without_overriding_project_choices() {
+        let provider = provider(vec![
+            model(
+                "gpt-default",
+                true,
+                AgentReasoningEffort::Medium,
+                &[AgentReasoningEffort::Medium],
+            ),
+            model(
+                "gpt-deep",
+                false,
+                AgentReasoningEffort::High,
+                &[AgentReasoningEffort::High, AgentReasoningEffort::Xhigh],
+            ),
+        ]);
+        let mut selections = ComposerSelections::default();
+
+        assert!(selections.choose_default_model(&provider, "gpt-deep"));
+        assert!(selections.choose_default_reasoning_effort(&provider, AgentReasoningEffort::Xhigh));
+        assert_eq!(
+            selections
+                .project_model("project-new", &provider)
+                .map(|model| model.id.as_str()),
+            Some("gpt-deep")
+        );
+        assert_eq!(
+            selections.project_reasoning_effort("project-new", &provider),
+            Some(AgentReasoningEffort::Xhigh)
+        );
+
+        assert!(selections.choose_project_model("project-explicit", &provider, "gpt-default"));
+        assert_eq!(
+            selections
+                .project_model("project-explicit", &provider)
+                .map(|model| model.id.as_str()),
+            Some("gpt-default")
+        );
+        assert_eq!(
+            selections.project_reasoning_effort("project-explicit", &provider),
+            Some(AgentReasoningEffort::Medium)
         );
     }
 

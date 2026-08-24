@@ -2,17 +2,6 @@
 
 use super::{TimelineStatus, TimelineTurn};
 
-pub(super) fn is_permission_placeholder(turn: &TimelineTurn) -> bool {
-    turn.prompt.is_empty()
-        && turn.steps.is_empty()
-        && turn.diff.is_none()
-        && turn.usage.is_none()
-        && turn.started_at.is_none()
-        && turn.completed_at.is_none()
-        && turn.duration_ms.is_none()
-        && turn.error.is_none()
-}
-
 pub(super) fn remember_turn_provider(turn: &mut TimelineTurn, provider: Option<&str>) {
     if turn.provider.is_none() {
         turn.provider = provider

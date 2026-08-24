@@ -9,6 +9,13 @@ pub(in crate::app) struct ComposerAttachment {
 }
 
 #[derive(Clone, Debug)]
+pub(in crate::app) struct QueuedPrompt {
+    pub(in crate::app) agent_id: String,
+    pub(in crate::app) text: String,
+    pub(in crate::app) options: corbit_client::AgentPromptOptions,
+}
+
+#[derive(Clone, Debug)]
 pub(in crate::app) struct RetryPrompt {
     pub(in crate::app) signature: String,
     pub(in crate::app) client_mutation_id: String,

@@ -1,7 +1,55 @@
-use super::settings::{settings_card, settings_page_header};
+use super::settings::settings_page_header;
 use super::*;
 
 impl ConnectionView {
+    pub(super) fn load_codex_official_plugins(
+        &mut self,
+        force_refetch: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.codex_official_plugin_task.is_some()
+            || !matches!(self.state, corbit_client::ConnectionState::Online)
+            || !self.feature_enabled("officialPlugins")
+        {
+            return;
+        }
+        let Some(client) = self
+            .runtime
+            .as_ref()
+            .map(corbit_client::DaemonRuntime::client)
+        else {
+            return;
+        };
+        self.codex_official_plugin_operation_in_flight = true;
+        self.codex_official_plugin_error = None;
+        self.codex_official_plugin_task = Some(cx.spawn(async move |view, cx| {
+            let result = client.codex_official_plugins(force_refetch).await;
+            let Some(view) = view.upgrade() else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.codex_official_plugin_task = None;
+                view.codex_official_plugin_operation_in_flight = false;
+                match result {
+                    Ok(catalog) => {
+                        view.codex_official_plugin_catalog = Some(catalog);
+                        view.codex_official_plugin_error = None;
+                        view.pending_codex_official_plugin_install = None;
+                        view.pending_codex_official_plugin_uninstall = None;
+                        if force_refetch {
+                            view.codex_official_apps_needing_auth.clear();
+                        }
+                    }
+                    Err(error) => {
+                        view.codex_official_plugin_error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     pub(super) fn load_plugins(&mut self, cx: &mut Context<Self>) {
         if self.plugin_task.is_some()
             || !matches!(self.state, corbit_client::ConnectionState::Online)
@@ -20,7 +68,6 @@ impl ConnectionView {
         self.plugin_task = Some(cx.spawn(async move |view, cx| {
             let plugins = client.plugins().await;
             let marketplace = client.plugin_marketplace().await;
-            let audit = client.plugin_audit(Some(50)).await;
             let Some(view) = view.upgrade() else {
                 return;
             };
@@ -31,19 +78,8 @@ impl ConnectionView {
                     (Ok(plugins), Ok(marketplace)) => {
                         view.plugins = plugins;
                         view.plugin_marketplace = marketplace;
-                        match audit {
-                            Ok(audit) => view.plugin_audit = audit,
-                            Err(error) if plugin_audit_is_unsupported(&error) => {
-                                view.plugin_audit.clear();
-                            }
-                            Err(error) => {
-                                view.plugin_audit.clear();
-                                view.show_warning(format!("读取插件执行记录失败：{error}"), cx);
-                            }
-                        }
                         view.pending_plugin_uninstall = None;
                         view.pending_plugin_update = None;
-                        view.pending_plugin_write = None;
                     }
                     (Err(error), _) | (_, Err(error)) => {
                         view.show_error(format!("读取插件目录失败：{error}"), cx);
@@ -55,7 +91,113 @@ impl ConnectionView {
         cx.notify();
     }
 
-    fn select_plugin_package(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn install_codex_official_plugin(
+        &mut self,
+        plugin_id: String,
+        marketplace_name: String,
+        plugin_name: String,
+        requires_confirmation: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if requires_confirmation
+            && self.pending_codex_official_plugin_install.as_deref() != Some(plugin_id.as_str())
+        {
+            self.pending_codex_official_plugin_install = Some(plugin_id);
+            self.show_warning(
+                "该 Codex 插件要求安装前确认，可能会连接外部服务；请再次点击安装",
+                cx,
+            );
+            return;
+        }
+        if self.codex_official_plugin_operation_in_flight {
+            self.show_warning("Codex 官方插件操作正在执行，请稍候", cx);
+            return;
+        }
+        let Some(client) = self
+            .runtime
+            .as_ref()
+            .map(corbit_client::DaemonRuntime::client)
+        else {
+            self.show_error("Daemon 尚未连接", cx);
+            return;
+        };
+        self.codex_official_plugin_operation_in_flight = true;
+        self.codex_official_plugin_task = Some(cx.spawn(async move |view, cx| {
+            let result = client
+                .install_codex_official_plugin(marketplace_name, plugin_name)
+                .await;
+            let Some(view) = view.upgrade() else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.codex_official_plugin_task = None;
+                view.codex_official_plugin_operation_in_flight = false;
+                view.pending_codex_official_plugin_install = None;
+                match result {
+                    Ok(result) => {
+                        view.codex_official_apps_needing_auth = result.apps_needing_auth;
+                        if view.codex_official_apps_needing_auth.is_empty() {
+                            view.show_success("Codex 官方插件已安装", cx);
+                        } else {
+                            view.show_success("Codex 官方插件已安装，请继续连接所需账号", cx);
+                        }
+                        view.load_codex_official_plugins(false, cx);
+                    }
+                    Err(error) => {
+                        view.show_error(format!("安装 Codex 官方插件失败：{error}"), cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn uninstall_codex_official_plugin(&mut self, plugin_id: String, cx: &mut Context<Self>) {
+        if self.pending_codex_official_plugin_uninstall.as_deref() != Some(plugin_id.as_str()) {
+            self.pending_codex_official_plugin_uninstall = Some(plugin_id);
+            self.show_warning("卸载后 Codex 将不再加载此官方插件，请再次点击确认", cx);
+            return;
+        }
+        if self.codex_official_plugin_operation_in_flight {
+            self.show_warning("Codex 官方插件操作正在执行，请稍候", cx);
+            return;
+        }
+        let Some(client) = self
+            .runtime
+            .as_ref()
+            .map(corbit_client::DaemonRuntime::client)
+        else {
+            self.show_error("Daemon 尚未连接", cx);
+            return;
+        };
+        self.codex_official_plugin_operation_in_flight = true;
+        self.codex_official_plugin_task = Some(cx.spawn(async move |view, cx| {
+            let result = client.uninstall_codex_official_plugin(plugin_id).await;
+            let Some(view) = view.upgrade() else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.codex_official_plugin_task = None;
+                view.codex_official_plugin_operation_in_flight = false;
+                view.pending_codex_official_plugin_uninstall = None;
+                match result {
+                    Ok(()) => {
+                        view.codex_official_apps_needing_auth.clear();
+                        view.show_success("Codex 官方插件已卸载", cx);
+                        view.load_codex_official_plugins(false, cx);
+                    }
+                    Err(error) => {
+                        view.show_error(format!("卸载 Codex 官方插件失败：{error}"), cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn select_plugin_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.plugin_operation_in_flight {
             self.show_warning("插件操作正在执行，请稍候", cx);
             return;
@@ -69,16 +211,15 @@ impl ConnectionView {
             return;
         };
         let path_prompt = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
+            files: false,
             directories: true,
             multiple: false,
-            prompt: Some("选择插件目录或 .corbit-plugin 文件".into()),
+            prompt: Some("选择包含 .codex-plugin/plugin.json 的插件目录".into()),
         });
         let window_handle = window.window_handle();
         self.plugin_operation_in_flight = true;
         self.plugin_task = Some(cx.spawn(async move |view, cx| {
-            let selection = path_prompt.await;
-            let path = match selection {
+            let path = match path_prompt.await {
                 Ok(Ok(Some(paths))) => paths.into_iter().next(),
                 Ok(Ok(None)) => None,
                 Ok(Err(error)) => {
@@ -86,7 +227,7 @@ impl ConnectionView {
                         let _ = view.update(cx, |view, cx| {
                             view.plugin_operation_in_flight = false;
                             view.plugin_task = None;
-                            view.show_error(format!("无法打开插件选择器：{error}"), cx);
+                            view.show_error(format!("无法打开插件目录选择器：{error}"), cx);
                             cx.notify();
                         });
                     }
@@ -97,7 +238,7 @@ impl ConnectionView {
                         let _ = view.update(cx, |view, cx| {
                             view.plugin_operation_in_flight = false;
                             view.plugin_task = None;
-                            view.show_error("插件选择器意外关闭，请重试", cx);
+                            view.show_error("插件目录选择器意外关闭，请重试", cx);
                             cx.notify();
                         });
                     }
@@ -117,10 +258,10 @@ impl ConnectionView {
             let Some(view_entity) = view.upgrade() else {
                 return;
             };
-            let result = client
+            match client
                 .inspect_plugin(path.to_string_lossy().into_owned())
-                .await;
-            match result {
+                .await
+            {
                 Ok(inspection) => {
                     let _ = cx.update_window(window_handle, |_, window, app| {
                         view_entity.update(app, |view, cx| {
@@ -136,16 +277,7 @@ impl ConnectionView {
                     let _ = view_entity.update(cx, |view, cx| {
                         view.plugin_task = None;
                         view.plugin_operation_in_flight = false;
-                        let message = if matches!(
-                            error,
-                            corbit_client::ClientError::Rpc(ref body)
-                                if body.code == "method_not_found"
-                        ) {
-                            "当前 Daemon 不支持本地插件预检，请更新 Daemon 后重试".to_owned()
-                        } else {
-                            format!("插件预检失败：{error}")
-                        };
-                        view.show_error(message, cx);
+                        view.show_error(format!("Codex 插件预检失败：{error}"), cx);
                         cx.notify();
                     });
                 }
@@ -185,7 +317,10 @@ impl ConnectionView {
                 match result {
                     Ok(plugin) => {
                         let action = if is_update { "更新" } else { "安装" };
-                        view.show_success(format!("已{action}插件 {}", plugin.manifest.name), cx);
+                        view.show_success(
+                            format!("已{action}插件 {}", plugin_display_name(&plugin.manifest)),
+                            cx,
+                        );
                         view.load_plugins(cx);
                     }
                     Err(error) => {
@@ -233,7 +368,7 @@ impl ConnectionView {
     fn uninstall_plugin(&mut self, plugin_id: String, cx: &mut Context<Self>) {
         if self.pending_plugin_uninstall.as_deref() != Some(plugin_id.as_str()) {
             self.pending_plugin_uninstall = Some(plugin_id);
-            self.show_warning("卸载插件会删除其本地文件，请再次点击确认", cx);
+            self.show_warning("卸载插件会删除其本地副本和插件数据，请再次点击确认", cx);
             return;
         }
         if self.plugin_operation_in_flight {
@@ -270,104 +405,19 @@ impl ConnectionView {
         cx.notify();
     }
 
-    fn execute_plugin_command(
-        &mut self,
-        plugin_id: String,
-        command_id: String,
-        command_name: String,
-        cx: &mut Context<Self>,
-    ) {
-        if self.plugin_operation_in_flight {
-            self.show_warning("插件操作正在执行，请稍候", cx);
-            return;
-        }
-        let Some(client) = self
-            .runtime
-            .as_ref()
-            .map(corbit_client::DaemonRuntime::client)
-        else {
-            self.show_error("Daemon 尚未连接", cx);
-            return;
-        };
-        let requires_write_approval = self.plugins.iter().any(|plugin| {
-            plugin.manifest.id == plugin_id
-                && plugin_permissions_require_workspace_write(&plugin.manifest.permissions)
-        });
-        let workspace_id = self.selected_workspace_id.clone();
-        let allow_workspace_write = if requires_write_approval {
-            if !self.feature_enabled("pluginWorkspaceWrite") {
-                self.show_error("当前 Daemon 版本不支持受控插件写入，请更新后重试", cx);
-                return;
-            }
-            let Some(approved_workspace_id) = workspace_id.as_deref() else {
-                self.show_error("请先选择允许插件写入的工作区", cx);
-                return;
-            };
-            let write_approval_key =
-                plugin_write_approval_key(&plugin_id, &command_id, approved_workspace_id);
-            if self.pending_plugin_write.as_deref() != Some(write_approval_key.as_str()) {
-                self.pending_plugin_write = Some(write_approval_key);
-                self.show_warning(
-                    "该插件声明工作区写入权限；仅本次命令有效，再次点击确认运行",
-                    cx,
-                );
-                return;
-            }
-            self.pending_plugin_write = None;
-            true
-        } else {
-            false
-        };
-        self.plugin_operation_in_flight = true;
-        self.plugin_task = Some(cx.spawn(async move |view, cx| {
-            let result = client
-                .execute_plugin_command(plugin_id, command_id, workspace_id, allow_workspace_write)
-                .await;
-            let Some(view) = view.upgrade() else {
-                return;
-            };
-            let _ = view.update(cx, |view, cx| {
-                view.plugin_task = None;
-                view.plugin_operation_in_flight = false;
-                match result {
-                    Ok(result) => {
-                        let capability_summary =
-                            plugin_capability_usage_summary(&result.capability_usage)
-                                .map(|summary| format!("（{summary}）"))
-                                .unwrap_or_default();
-                        view.show_success(
-                            format!("{command_name}：{}{capability_summary}", result.message),
-                            cx,
-                        );
-                    }
-                    Err(error) => view.show_error(format!("运行插件命令失败：{error}"), cx),
-                }
-                view.load_plugins(cx);
-                cx.notify();
-            });
-        }));
-        cx.notify();
-    }
-
     fn install_marketplace_plugin(
         &mut self,
         plugin_id: String,
-        version: String,
+        version: Option<String>,
         is_update: bool,
-        permission_escalation: &[corbit_client::PluginPermission],
         cx: &mut Context<Self>,
     ) {
-        if is_update
-            && !permission_escalation.is_empty()
-            && self.pending_plugin_update.as_deref() != Some(plugin_id.as_str())
-        {
-            let labels = permission_escalation
-                .iter()
-                .map(plugin_permission_label)
-                .collect::<Vec<_>>()
-                .join("、");
+        if is_update && self.pending_plugin_update.as_deref() != Some(plugin_id.as_str()) {
             self.pending_plugin_update = Some(plugin_id);
-            self.show_warning(format!("更新将新增权限：{labels}，请再次点击确认"), cx);
+            self.show_warning(
+                "市场插件将从声明的来源重新获取并替换当前版本，请再次点击确认",
+                cx,
+            );
             return;
         }
         if self.plugin_operation_in_flight {
@@ -384,9 +434,7 @@ impl ConnectionView {
         };
         self.plugin_operation_in_flight = true;
         self.plugin_task = Some(cx.spawn(async move |view, cx| {
-            let result = client
-                .install_marketplace_plugin(plugin_id, Some(version))
-                .await;
+            let result = client.install_marketplace_plugin(plugin_id, version).await;
             let Some(view) = view.upgrade() else {
                 return;
             };
@@ -396,17 +444,16 @@ impl ConnectionView {
                 view.pending_plugin_update = None;
                 match result {
                     Ok(plugin) => {
-                        let message = if is_update {
-                            format!("已更新插件 {}", plugin.manifest.name)
-                        } else {
-                            format!("已安装已验证插件 {}", plugin.manifest.name)
-                        };
-                        view.show_success(message, cx);
+                        let action = if is_update { "更新" } else { "安装" };
+                        view.show_success(
+                            format!("已{action}插件 {}", plugin_display_name(&plugin.manifest)),
+                            cx,
+                        );
                         view.load_plugins(cx);
                     }
                     Err(error) => {
-                        let operation = if is_update { "更新" } else { "安装" };
-                        view.show_error(format!("{operation}市场插件失败：{error}"), cx);
+                        let action = if is_update { "更新" } else { "安装" };
+                        view.show_error(format!("{action}市场插件失败：{error}"), cx);
                     }
                 }
                 cx.notify();
@@ -418,6 +465,88 @@ impl ConnectionView {
     #[allow(clippy::too_many_lines)]
     pub(super) fn render_plugin_settings(&self, is_online: bool, cx: &mut Context<Self>) -> Div {
         let supported = self.feature_enabled("plugins");
+        let official_supported = self.feature_enabled("officialPlugins");
+        let official_query = self
+            .codex_official_plugin_search
+            .read(cx)
+            .value()
+            .trim()
+            .to_lowercase();
+        let featured_ids = self
+            .codex_official_plugin_catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .featured_plugin_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let matching_official_plugins =
+            self.codex_official_plugin_catalog
+                .as_ref()
+                .map_or(0, |catalog| {
+                    catalog
+                        .marketplaces
+                        .iter()
+                        .flat_map(|marketplace| marketplace.plugins.iter())
+                        .filter(|plugin| official_plugin_matches(plugin, &official_query))
+                        .count()
+                });
+        let mut official_installed_rows = Vec::new();
+        let mut official_featured_rows = Vec::new();
+        let mut official_marketplace_sections = Vec::new();
+        let mut official_row_index = 0_usize;
+        if let Some(catalog) = self.codex_official_plugin_catalog.as_ref() {
+            for marketplace in &catalog.marketplaces {
+                let mut marketplace_rows = Vec::new();
+                for plugin in &marketplace.plugins {
+                    if !official_plugin_matches(plugin, &official_query) {
+                        continue;
+                    }
+                    let row = official_plugin_row(
+                        official_row_index,
+                        &marketplace.name,
+                        plugin,
+                        is_online,
+                        self.codex_official_plugin_operation_in_flight,
+                        self.pending_codex_official_plugin_install.as_deref(),
+                        self.pending_codex_official_plugin_uninstall.as_deref(),
+                        cx,
+                    );
+                    official_row_index += 1;
+                    if plugin.installed {
+                        official_installed_rows.push(row);
+                    } else if featured_ids.contains(plugin.id.as_str()) {
+                        official_featured_rows.push(row);
+                    } else {
+                        marketplace_rows.push(row);
+                    }
+                }
+                if !marketplace_rows.is_empty() {
+                    official_marketplace_sections.push(
+                        div()
+                            .v_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .pt_2()
+                                    .text_size(font_px(FONT_SIZE_SM))
+                                    .font_semibold()
+                                    .child(marketplace.display_name.clone()),
+                            )
+                            .children(marketplace_rows),
+                    );
+                }
+            }
+        }
+        let official_auth_rows = self
+            .codex_official_apps_needing_auth
+            .iter()
+            .enumerate()
+            .map(|(index, app)| official_auth_app_row(index, app, cx))
+            .collect::<Vec<_>>();
         let plugin_cards = self
             .plugins
             .iter()
@@ -449,124 +578,561 @@ impl ConnectionView {
                 )
             })
             .collect::<Vec<_>>();
-        let audit_rows = self
-            .plugin_audit
-            .iter()
-            .map(|entry| {
-                let plugin_name = self
-                    .plugins
-                    .iter()
-                    .find(|plugin| plugin.manifest.id == entry.plugin_id)
-                    .map_or(entry.plugin_id.as_str(), |plugin| {
-                        plugin.manifest.name.as_str()
-                    });
-                plugin_audit_row(entry, plugin_name)
-            })
-            .collect::<Vec<_>>();
 
-        settings_page_header("插件", "管理内置插件，并从本机插件目录安装第三方插件。")
-            .when(!supported, |page| {
-                page.child(
-                    settings_card("插件功能不可用").child(
-                        div()
-                            .text_size(font_px(FONT_SIZE_SM))
-                            .text_color(rgb(COLOR_TEXT_SECONDARY))
-                            .child("当前 Daemon 版本未提供插件管理能力，请更新并重新连接。"),
-                    ),
+        settings_page_header(
+            "插件",
+            "浏览 Codex 托管插件，或安装可跨 Codex、Claude 和 ACP 使用的本地 Codex 插件。",
+        )
+        .child(
+            settings_card("Codex 官方插件（实验性）")
+                .child(
+                    div()
+                        .text_size(font_px(FONT_SIZE_SM))
+                        .line_height(px(19.))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .child(
+                            "目录、安装和账号授权由本机 Codex App Server 管理；连接器仅保证在 Codex Provider 中完整可用。",
+                        ),
                 )
-            })
-            .child(
-                settings_card("本地插件")
-                    .child(
+                .child(
+                    div()
+                        .h_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(settings_input(&self.codex_official_plugin_search)),
+                        )
+                        .child(
+                            settings_action_button("codex-official-plugin-refresh", cx)
+                                .icon(Icon::new(AppIcon::Refresh))
+                                .label("刷新")
+                                .loading(self.codex_official_plugin_operation_in_flight)
+                                .disabled(
+                                    !official_supported
+                                        || !is_online
+                                        || self.codex_official_plugin_operation_in_flight,
+                                )
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.load_codex_official_plugins(true, cx);
+                                })),
+                        ),
+                )
+                .when(!official_supported, |card| {
+                    card.child(
                         div()
+                            .rounded_lg()
+                            .bg(rgb(COLOR_SURFACE_SECONDARY))
+                            .p_3()
                             .text_size(font_px(FONT_SIZE_SM))
-                            .line_height(px(19.))
                             .text_color(rgb(COLOR_TEXT_SECONDARY))
                             .child(
-                                "插件由 Daemon 管理。第三方插件需要声明权限，并运行在独立进程中。",
+                                "当前 Daemon 或 Codex 版本未提供官方插件目录；本地插件仍可正常管理。",
                             ),
                     )
-                    .child(
+                })
+                .when_some(self.codex_official_plugin_error.clone(), |card, error| {
+                    card.child(
                         div()
-                            .h_flex()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(COLOR_WARNING))
+                            .p_3()
+                            .text_size(font_px(FONT_SIZE_SM))
+                            .text_color(rgb(COLOR_WARNING))
+                            .child(format!("Codex 官方目录暂时不可用：{error}")),
+                    )
+                })
+                .when(!official_auth_rows.is_empty(), |card| {
+                    card.child(
+                        div()
+                            .v_flex()
                             .gap_2()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(COLOR_BORDER))
+                            .bg(rgb(COLOR_SURFACE_SECONDARY))
+                            .p_3()
+                            .child(div().font_semibold().child("连接账号以完成设置"))
                             .child(
-                                Button::new("plugin-install-local")
-                                    .primary()
-                                    .small()
-                                    .icon(Icon::new(AppIcon::Add))
-                                    .label("安装本地插件")
-                                    .loading(self.plugin_operation_in_flight)
-                                    .disabled(
-                                        !supported || !is_online || self.plugin_operation_in_flight,
-                                    )
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.select_plugin_package(window, cx);
-                                    })),
+                                div()
+                                    .text_size(font_px(FONT_SIZE_XS))
+                                    .text_color(rgb(COLOR_TEXT_TERTIARY))
+                                    .child(
+                                        "授权页面由 Codex 提供，Corbit 不读取或保存 Gmail、Slack 等服务的 OAuth 凭据。",
+                                    ),
                             )
-                            .child(
-                                Button::new("plugin-refresh")
-                                    .outline()
-                                    .small()
-                                    .icon(Icon::new(AppIcon::Refresh))
-                                    .label("刷新")
-                                    .disabled(
-                                        !supported || !is_online || self.plugin_operation_in_flight,
-                                    )
-                                    .on_click(cx.listener(|view, _, _, cx| view.load_plugins(cx))),
-                            ),
+                            .children(official_auth_rows),
                     )
-                    .when(self.plugins.is_empty(), |card| {
+                })
+                .when(
+                    official_supported
+                        && self.codex_official_plugin_catalog.is_none()
+                        && self.codex_official_plugin_error.is_none(),
+                    |card| {
                         card.child(
                             div()
                                 .py_2()
                                 .text_size(font_px(FONT_SIZE_SM))
                                 .text_color(rgb(COLOR_TEXT_TERTIARY))
-                                .child("暂无已安装插件。"),
+                                .child(if self.codex_official_plugin_operation_in_flight {
+                                    "正在读取 Codex 官方目录…"
+                                } else {
+                                    "尚未读取 Codex 官方目录。"
+                                }),
                         )
-                    })
-                    .children(plugin_cards),
+                    },
+                )
+                .when(!official_installed_rows.is_empty(), |card| {
+                    card.child(official_plugin_section("已安装", official_installed_rows))
+                })
+                .when(!official_featured_rows.is_empty(), |card| {
+                    card.child(official_plugin_section("精选", official_featured_rows))
+                })
+                .children(official_marketplace_sections)
+                .when(
+                    self.codex_official_plugin_catalog.is_some()
+                        && matching_official_plugins == 0,
+                    |card| {
+                        card.child(
+                            div()
+                                .py_3()
+                                .text_size(font_px(FONT_SIZE_SM))
+                                .text_color(rgb(COLOR_TEXT_TERTIARY))
+                                .child(if official_query.is_empty() {
+                                    "Codex 当前未返回可展示的官方插件。"
+                                } else {
+                                    "没有匹配的 Codex 官方插件。"
+                                }),
+                        )
+                    },
+                )
+                .when_some(
+                    self.codex_official_plugin_catalog.as_ref().and_then(|catalog| {
+                        (!catalog.marketplace_load_errors.is_empty())
+                            .then(|| catalog.marketplace_load_errors.join("；"))
+                    }),
+                    |card, errors| {
+                        card.child(
+                            div()
+                                .text_size(font_px(FONT_SIZE_XS))
+                                .text_color(rgb(COLOR_WARNING))
+                                .child(format!("部分市场加载失败：{errors}")),
+                        )
+                    },
+                ),
+        )
+        .when(!supported, |page| {
+            page.child(
+                settings_card("插件功能不可用").child(
+                    div()
+                        .text_size(font_px(FONT_SIZE_SM))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .child("当前 Daemon 版本未提供插件管理能力，请更新并重新连接。"),
+                ),
             )
-            .child(
-                settings_card("最近执行记录")
-                    .child(
+        })
+        .child(
+            settings_card("Corbit 本地插件")
+                .child(
+                    div()
+                        .text_size(font_px(FONT_SIZE_SM))
+                        .line_height(px(19.))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .child(
+                            "只接受包含 .codex-plugin/plugin.json 的目录；旧 Corbit 清单和压缩包不再支持。",
+                        ),
+                )
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .child(
+                            settings_primary_action_button("plugin-install-local", cx)
+                                .icon(Icon::new(AppIcon::Add))
+                                .label("安装 Codex 插件目录")
+                                .loading(self.plugin_operation_in_flight)
+                                .disabled(
+                                    !supported || !is_online || self.plugin_operation_in_flight,
+                                )
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.select_plugin_directory(window, cx);
+                                })),
+                        )
+                        .child(
+                            settings_action_button("plugin-refresh", cx)
+                                .icon(Icon::new(AppIcon::Refresh))
+                                .label("刷新")
+                                .disabled(
+                                    !supported || !is_online || self.plugin_operation_in_flight,
+                                )
+                                .on_click(cx.listener(|view, _, _, cx| view.load_plugins(cx))),
+                        ),
+                )
+                .when(self.plugins.is_empty(), |card| {
+                    card.child(
                         div()
+                            .py_2()
                             .text_size(font_px(FONT_SIZE_SM))
-                            .line_height(px(19.))
-                            .text_color(rgb(COLOR_TEXT_SECONDARY))
-                            .child("仅显示最近的脱敏记录，不保存命令参数、文件路径或文件内容。"),
+                            .text_color(rgb(COLOR_TEXT_TERTIARY))
+                            .child("暂无已安装插件。"),
                     )
-                    .when(self.plugin_audit.is_empty(), |card| {
-                        card.child(
-                            div()
-                                .py_2()
-                                .text_size(font_px(FONT_SIZE_SM))
-                                .text_color(rgb(COLOR_TEXT_TERTIARY))
-                                .child("暂无插件执行记录。"),
-                        )
-                    })
-                    .children(audit_rows),
-            )
-            .child(
-                settings_card("插件市场")
-                    .child(
+                })
+                .children(plugin_cards),
+        )
+        .child(
+            settings_card("Corbit 插件市场")
+                .child(
+                    div()
+                        .text_size(font_px(FONT_SIZE_SM))
+                        .line_height(px(19.))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .child(
+                            "读取官方 marketplace.json 结构，支持本地、Git 子目录和 NPM 来源。",
+                        ),
+                )
+                .when(self.plugin_marketplace.is_empty(), |card| {
+                    card.child(
                         div()
+                            .py_2()
                             .text_size(font_px(FONT_SIZE_SM))
-                            .text_color(rgb(COLOR_TEXT_SECONDARY))
-                            .child("展示 Daemon 内置插件和通过签名索引校验的第三方插件。"),
+                            .text_color(rgb(COLOR_TEXT_TERTIARY))
+                            .child("未配置插件市场，或市场当前没有条目。"),
                     )
-                    .when(self.plugin_marketplace.is_empty(), |card| {
-                        card.child(
-                            div()
-                                .py_2()
-                                .text_size(font_px(FONT_SIZE_SM))
-                                .text_color(rgb(COLOR_TEXT_TERTIARY))
-                                .child("连接 Daemon 后加载插件目录。"),
-                        )
-                    })
-                    .children(marketplace_cards),
-            )
+                })
+                .children(marketplace_cards),
+        )
     }
+}
+
+fn official_plugin_section(title: &'static str, rows: Vec<Div>) -> Div {
+    div()
+        .v_flex()
+        .gap_2()
+        .child(
+            div()
+                .pt_2()
+                .text_size(font_px(FONT_SIZE_SM))
+                .font_semibold()
+                .child(title),
+        )
+        .children(rows)
+}
+
+fn official_plugin_matches(
+    plugin: &corbit_client::CodexOfficialPluginSummary,
+    query: &str,
+) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let interface = plugin.interface.as_ref();
+    [
+        Some(plugin.id.as_str()),
+        Some(plugin.name.as_str()),
+        interface.and_then(|value| value.display_name.as_deref()),
+        interface.and_then(|value| value.short_description.as_deref()),
+        interface.and_then(|value| value.long_description.as_deref()),
+        interface.and_then(|value| value.developer_name.as_deref()),
+        interface.and_then(|value| value.category.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.to_lowercase().contains(query))
+        || plugin
+            .keywords
+            .iter()
+            .any(|keyword| keyword.to_lowercase().contains(query))
+}
+
+fn official_plugin_display_name(plugin: &corbit_client::CodexOfficialPluginSummary) -> String {
+    plugin
+        .interface
+        .as_ref()
+        .and_then(|interface| interface.display_name.clone())
+        .unwrap_or_else(|| plugin.name.clone())
+}
+
+fn official_plugin_description(plugin: &corbit_client::CodexOfficialPluginSummary) -> String {
+    plugin
+        .interface
+        .as_ref()
+        .and_then(|interface| {
+            interface
+                .short_description
+                .clone()
+                .or_else(|| interface.long_description.clone())
+        })
+        .unwrap_or_else(|| "Codex 官方托管插件".into())
+}
+
+fn official_plugin_logo(plugin: &corbit_client::CodexOfficialPluginSummary) -> AnyElement {
+    let interface = plugin.interface.as_ref();
+    let logo_url = if is_dark_mode() {
+        interface.and_then(|value| {
+            value
+                .logo_url_dark
+                .as_ref()
+                .or(value.logo_url.as_ref())
+                .cloned()
+        })
+    } else {
+        interface.and_then(|value| value.logo_url.clone())
+    };
+    logo_url.map_or_else(
+        || {
+            div()
+                .flex()
+                .size(px(38.))
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(COLOR_BORDER))
+                .bg(rgb(COLOR_SURFACE_SECONDARY))
+                .child(
+                    Icon::new(AppIcon::Tool)
+                        .size(px(19.))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY)),
+                )
+                .into_any_element()
+        },
+        |url| {
+            div()
+                .size(px(38.))
+                .flex_none()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(COLOR_BORDER))
+                .overflow_hidden()
+                .child(img(SharedString::from(url)).size_full())
+                .into_any_element()
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn official_plugin_row(
+    index: usize,
+    marketplace_name: &str,
+    plugin: &corbit_client::CodexOfficialPluginSummary,
+    is_online: bool,
+    operation_in_flight: bool,
+    pending_install: Option<&str>,
+    pending_uninstall: Option<&str>,
+    cx: &mut Context<ConnectionView>,
+) -> Div {
+    let install_view = cx.entity();
+    let uninstall_view = install_view.clone();
+    let plugin_id = plugin.id.clone();
+    let install_plugin_id = plugin_id.clone();
+    let uninstall_plugin_id = plugin_id.clone();
+    let marketplace_name = marketplace_name.to_owned();
+    let plugin_name = plugin.name.clone();
+    let requires_confirmation = plugin.must_show_installation_interstitial.unwrap_or(false);
+    let admin_disabled = plugin.availability == "DISABLED_BY_ADMIN";
+    let installed_by_default = plugin.install_policy == "INSTALLED_BY_DEFAULT";
+    let install_allowed = is_online
+        && !operation_in_flight
+        && !admin_disabled
+        && plugin.install_policy == "AVAILABLE";
+    let uninstall_allowed = is_online
+        && !operation_in_flight
+        && plugin.installed
+        && !admin_disabled
+        && !installed_by_default;
+    let install_confirmation_pending = pending_install == Some(plugin.id.as_str());
+    let uninstall_confirmation_pending = pending_uninstall == Some(plugin.id.as_str());
+    let metadata = plugin.interface.as_ref().map_or_else(
+        || plugin.source_type.clone(),
+        |interface| {
+            [
+                interface.category.clone(),
+                interface.developer_name.clone(),
+                plugin.version.as_ref().map(|version| format!("v{version}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ")
+        },
+    );
+
+    div()
+        .h_flex()
+        .items_center()
+        .gap_3()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(COLOR_BORDER))
+        .bg(rgb(COLOR_SURFACE))
+        .p_3()
+        .child(official_plugin_logo(plugin))
+        .child(
+            div()
+                .v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .font_medium()
+                                .child(official_plugin_display_name(plugin)),
+                        )
+                        .when(admin_disabled, |title| {
+                            title.child(official_plugin_status_badge("管理员已禁用", COLOR_WARNING))
+                        })
+                        .when(plugin.installed && !admin_disabled, |title| {
+                            title.child(official_plugin_status_badge(
+                                if plugin.enabled {
+                                    "已安装"
+                                } else {
+                                    "已停用"
+                                },
+                                if plugin.enabled {
+                                    COLOR_SUCCESS
+                                } else {
+                                    COLOR_TEXT_TERTIARY
+                                },
+                            ))
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(font_px(FONT_SIZE_SM))
+                        .line_height(px(18.))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .child(official_plugin_description(plugin)),
+                )
+                .when(!metadata.is_empty(), |details| {
+                    details.child(
+                        div()
+                            .text_size(font_px(FONT_SIZE_XS))
+                            .text_color(rgb(COLOR_TEXT_TERTIARY))
+                            .child(metadata),
+                    )
+                }),
+        )
+        .when(!plugin.installed, |row| {
+            row.child(
+                settings_primary_action_button(("codex-official-install", index), cx)
+                    .icon(Icon::new(AppIcon::Add))
+                    .label(if admin_disabled {
+                        "不可安装"
+                    } else if plugin.install_policy == "NOT_AVAILABLE" {
+                        "不可用"
+                    } else if install_confirmation_pending {
+                        "确认安装"
+                    } else {
+                        "安装"
+                    })
+                    .disabled(!install_allowed)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        let plugin_id = install_plugin_id.clone();
+                        let marketplace_name = marketplace_name.clone();
+                        let plugin_name = plugin_name.clone();
+                        install_view.update(cx, |view, cx| {
+                            view.install_codex_official_plugin(
+                                plugin_id,
+                                marketplace_name,
+                                plugin_name,
+                                requires_confirmation,
+                                cx,
+                            );
+                        });
+                    })),
+            )
+        })
+        .when(plugin.installed && uninstall_allowed, |row| {
+            row.child(
+                settings_danger_action_button(("codex-official-uninstall", index), cx)
+                    .label(if uninstall_confirmation_pending {
+                        "确认卸载"
+                    } else {
+                        "卸载"
+                    })
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        let plugin_id = uninstall_plugin_id.clone();
+                        uninstall_view.update(cx, |view, cx| {
+                            view.uninstall_codex_official_plugin(plugin_id, cx);
+                        });
+                    })),
+            )
+        })
+        .when(
+            plugin.installed && !uninstall_allowed && installed_by_default,
+            |row| {
+                row.child(official_plugin_status_badge(
+                    "默认安装",
+                    COLOR_TEXT_TERTIARY,
+                ))
+            },
+        )
+}
+
+fn official_plugin_status_badge(label: &'static str, color: u32) -> Div {
+    div()
+        .flex_none()
+        .rounded_full()
+        .bg(rgb(COLOR_SURFACE_SECONDARY))
+        .px_2()
+        .py_1()
+        .text_size(font_px(FONT_SIZE_XS))
+        .text_color(rgb(color))
+        .child(label)
+}
+
+fn official_auth_app_row(
+    index: usize,
+    app: &corbit_client::CodexOfficialPluginApp,
+    cx: &mut Context<ConnectionView>,
+) -> Div {
+    let install_url = app.install_url.clone();
+    div()
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .child(
+            Icon::new(AppIcon::User)
+                .size(px(16.))
+                .text_color(rgb(COLOR_TEXT_SECONDARY)),
+        )
+        .child(
+            div()
+                .v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(app.name.clone())
+                .when_some(app.description.clone(), |details, description| {
+                    details.child(
+                        div()
+                            .text_size(font_px(FONT_SIZE_XS))
+                            .text_color(rgb(COLOR_TEXT_TERTIARY))
+                            .child(description),
+                    )
+                }),
+        )
+        .child(
+            settings_primary_action_button(("codex-official-auth", index), cx)
+                .icon(Icon::new(AppIcon::ExternalLink))
+                .label(if install_url.is_some() {
+                    "连接账号"
+                } else {
+                    "等待 Codex"
+                })
+                .disabled(install_url.is_none())
+                .when_some(install_url, |button, url| {
+                    button.on_click(move |_, _, cx| cx.open_url(&url))
+                }),
+        )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -578,19 +1144,14 @@ fn open_plugin_inspection_dialog(
 ) {
     let inspection_id = inspection.inspection_id.clone();
     let manifest = inspection.manifest.clone();
-    let source_kind = match inspection.source_kind {
-        corbit_client::PluginSourceKind::Directory => "本地目录",
-        corbit_client::PluginSourceKind::Archive => ".corbit-plugin 压缩包",
-    };
-    let source_kind = source_kind.to_owned();
+    let components = inspection.components.clone();
+    let compatibility = inspection.provider_compatibility.clone();
     let is_update = matches!(
         inspection.operation,
         corbit_client::PluginInspectionOperation::Update
     );
     let operation_label = if is_update { "更新" } else { "安装" };
     let installed_version = inspection.installed_version.clone();
-    let permission_escalation = inspection.permission_escalation.clone();
-    let unavailable_permissions = inspection.unavailable_permissions.clone();
     let fingerprint = inspection
         .source_fingerprint
         .chars()
@@ -602,77 +1163,10 @@ fn open_plugin_inspection_dialog(
     let footer_cancel_view = view.clone();
     window.open_dialog(cx, move |dialog, _window, _cx| {
         let manifest = manifest.clone();
-        let source_kind = source_kind.clone();
+        let components = components.clone();
+        let compatibility = compatibility.clone();
         let fingerprint = fingerprint.clone();
         let installed_version = installed_version.clone();
-        let permission_escalation = permission_escalation.clone();
-        let unavailable_permissions = unavailable_permissions.clone();
-        let permission_badges = manifest
-            .permissions
-            .iter()
-            .map(|permission| {
-                div()
-                    .flex_none()
-                    .rounded_full()
-                    .bg(rgb(COLOR_SURFACE_SECONDARY))
-                    .px_2()
-                    .py_1()
-                    .text_size(font_px(FONT_SIZE_XS))
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
-                    .child(plugin_permission_label(permission))
-            })
-            .collect::<Vec<_>>();
-        let command_rows = manifest
-            .commands
-            .iter()
-            .map(|command| {
-                div()
-                    .v_flex()
-                    .gap_1()
-                    .child(div().font_medium().child(command.name.clone()))
-                    .child(
-                        div()
-                            .text_size(font_px(FONT_SIZE_XS))
-                            .text_color(rgb(COLOR_TEXT_TERTIARY))
-                            .child(
-                                command
-                                    .description
-                                    .clone()
-                                    .unwrap_or_else(|| command.id.clone()),
-                            ),
-                    )
-            })
-            .collect::<Vec<_>>();
-        let permission_content = if permission_badges.is_empty() {
-            div()
-                .text_size(font_px(FONT_SIZE_SM))
-                .text_color(rgb(COLOR_TEXT_TERTIARY))
-                .child("无额外权限")
-        } else {
-            div().h_flex().flex_wrap().gap_1().children(permission_badges)
-        };
-        let escalation_labels = permission_escalation
-            .iter()
-            .map(plugin_permission_label)
-            .collect::<Vec<_>>();
-        let escalation_content = escalation_labels.join("、");
-        let unavailable_labels = unavailable_permission_labels(&unavailable_permissions);
-        let unavailable_content = unavailable_labels.join("、");
-        let command_content: AnyElement = if command_rows.is_empty() {
-            div()
-                .text_size(font_px(FONT_SIZE_SM))
-                .text_color(rgb(COLOR_TEXT_TERTIARY))
-                .child("未声明命令")
-                .into_any_element()
-        } else {
-            div()
-                .v_flex()
-                .gap_2()
-                .max_h(px(240.))
-                .overflow_y_scrollbar()
-                .children(command_rows)
-                .into_any_element()
-        };
         let confirm_view = confirm_view.clone();
         let confirm_id = confirm_id.clone();
         let cancel_view = cancel_view.clone();
@@ -684,7 +1178,7 @@ fn open_plugin_inspection_dialog(
                     .w_full()
                     .items_center()
                     .justify_between()
-                    .child(format!("确认{operation_label}本地插件"))
+                    .child(format!("确认{operation_label} Codex 插件"))
                     .child(
                         Button::new("plugin-inspection-close")
                             .ghost()
@@ -740,21 +1234,23 @@ fn open_plugin_inspection_dialog(
                         div()
                             .text_size(font_px(FONT_SIZE_HEADING))
                             .font_medium()
-                            .child(manifest.name.clone()),
+                            .child(plugin_display_name(&manifest)),
                     )
                     .child(
                         div()
                             .text_size(font_px(FONT_SIZE_SM))
                             .text_color(rgb(COLOR_TEXT_SECONDARY))
-                            .child(manifest.description.clone()),
+                            .child(plugin_description(&manifest)),
                     )
                     .child(
                         div()
                             .text_size(font_px(FONT_SIZE_XS))
                             .text_color(rgb(COLOR_TEXT_TERTIARY))
                             .child(format!(
-                                "ID：{} · 发布者：{} · 版本：v{}",
-                                manifest.id, manifest.publisher, manifest.version
+                                "ID：{} · 作者：{} · 版本：{}",
+                                manifest.name,
+                                plugin_author(&manifest),
+                                plugin_version(&manifest)
                             )),
                     )
                     .when_some(installed_version, |content, version| {
@@ -763,8 +1259,8 @@ fn open_plugin_inspection_dialog(
                                 .text_size(font_px(FONT_SIZE_XS))
                                 .text_color(rgb(COLOR_TEXT_TERTIARY))
                                 .child(format!(
-                                    "当前已安装版本：v{version} → 目标版本：v{}",
-                                    manifest.version
+                                    "当前版本：v{version} → 目标版本：{}",
+                                    plugin_version(&manifest)
                                 )),
                         )
                     })
@@ -772,134 +1268,23 @@ fn open_plugin_inspection_dialog(
                         div()
                             .text_size(font_px(FONT_SIZE_XS))
                             .text_color(rgb(COLOR_TEXT_TERTIARY))
-                            .child(format!(
-                                "来源：{source_kind} · 运行时：独立进程 · 指纹：{fingerprint}…"
-                            )),
+                            .child(format!("目录来源 · 指纹：{fingerprint}…")),
                     )
-                    .child(div().font_medium().child("请求权限"))
-                    .child(permission_content)
-                    .when(!unavailable_content.is_empty(), |content| {
-                        content.child(
-                            div()
-                                .text_size(font_px(FONT_SIZE_XS))
-                                .text_color(rgb(COLOR_WARNING))
-                                .child(format!("当前 Daemon 未提供这些权限对应的能力宿主：{unavailable_content}")),
-                        )
-                    })
-                    .when(!escalation_content.is_empty(), |content| {
-                        content.child(
-                            div()
-                                .text_size(font_px(FONT_SIZE_XS))
-                                .text_color(rgb(COLOR_WARNING))
-                                .child(format!(
-                                    "本次{operation_label}新增权限：{escalation_content}"
-                                )),
-                        )
-                    })
-                    .child(div().font_medium().child("可用命令"))
-                    .child(command_content)
+                    .child(component_summary(&components))
+                    .child(div().font_medium().child("Provider 兼容性"))
+                    .child(provider_compatibility_rows(&compatibility))
                     .child(
                         div()
                             .text_size(font_px(FONT_SIZE_XS))
                             .text_color(rgb(COLOR_WARNING))
-                            .child("第三方插件在独立进程运行，但不是完整的操作系统沙箱。请只安装信任来源的插件。"),
+                            .child(
+                                "Skills 会作为说明注入，MCP Server 可能启动本地进程或访问远程服务；请只安装信任来源的插件。",
+                            ),
                     ),
             )
     });
 }
 
-fn plugin_audit_is_unsupported(error: &corbit_client::ClientError) -> bool {
-    matches!(
-        error,
-        corbit_client::ClientError::Rpc(body)
-            if matches!(body.code.as_str(), "method_not_found" | "root_credential_required")
-    )
-}
-
-fn plugin_audit_row(entry: &corbit_client::PluginAuditEntry, plugin_name: &str) -> Div {
-    let (status_label, status_color) = match entry.status {
-        corbit_client::PluginAuditStatus::Succeeded => ("成功", COLOR_SUCCESS),
-        corbit_client::PluginAuditStatus::Failed => ("失败", COLOR_ERROR),
-    };
-    let plugin_label = if plugin_name == entry.plugin_id {
-        entry.plugin_id.clone()
-    } else {
-        format!("{plugin_name} · {}", entry.plugin_id)
-    };
-    let capability_summary = plugin_capability_usage_summary(&entry.capability_usage);
-
-    div()
-        .v_flex()
-        .gap_1()
-        .rounded_lg()
-        .bg(rgb(COLOR_SURFACE_SECONDARY))
-        .px_3()
-        .py_2()
-        .child(
-            div()
-                .h_flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(font_px(FONT_SIZE_SM))
-                        .font_medium()
-                        .child(plugin_label),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .rounded_full()
-                        .px_2()
-                        .py_1()
-                        .text_size(font_px(FONT_SIZE_XS))
-                        .text_color(rgb(status_color))
-                        .child(status_label),
-                ),
-        )
-        .child(
-            div()
-                .text_size(font_px(FONT_SIZE_XS))
-                .text_color(rgb(COLOR_TEXT_SECONDARY))
-                .child(format!(
-                    "命令 {} · {}",
-                    entry.command_id,
-                    plugin_audit_completed_at(&entry.completed_at)
-                )),
-        )
-        .when_some(capability_summary, |row, summary| {
-            row.child(
-                div()
-                    .text_size(font_px(FONT_SIZE_XS))
-                    .text_color(rgb(COLOR_TEXT_TERTIARY))
-                    .child(summary),
-            )
-        })
-        .when_some(entry.error_code.clone(), |row, error_code| {
-            row.child(
-                div()
-                    .text_size(font_px(FONT_SIZE_XS))
-                    .text_color(rgb(COLOR_ERROR))
-                    .child(format!("错误码：{error_code}")),
-            )
-        })
-}
-
-fn plugin_audit_completed_at(value: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(value).map_or_else(
-        |_| value.to_string(),
-        |date_time| {
-            date_time
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        },
-    )
-}
-
-#[allow(clippy::too_many_lines)]
 fn installed_plugin_card(
     index: usize,
     plugin: &corbit_client::PluginRecord,
@@ -910,62 +1295,13 @@ fn installed_plugin_card(
 ) -> Div {
     let toggle_view = cx.entity();
     let uninstall_view = toggle_view.clone();
-    let plugin_id = plugin.manifest.id.clone();
+    let plugin_id = plugin.plugin_id.clone();
     let uninstall_id = plugin_id.clone();
     let enabled = plugin.enabled;
     let action_disabled = !is_online || operation_in_flight;
-    let unavailable_summary = plugin
-        .unavailable_permissions
-        .iter()
-        .map(plugin_permission_label)
-        .collect::<Vec<_>>()
-        .join("、");
-    let permission_badges = plugin
-        .manifest
-        .permissions
-        .iter()
-        .map(|permission| {
-            div()
-                .flex_none()
-                .rounded_full()
-                .bg(rgb(COLOR_SURFACE_SECONDARY))
-                .px_2()
-                .py_1()
-                .text_size(font_px(FONT_SIZE_XS))
-                .text_color(rgb(COLOR_TEXT_SECONDARY))
-                .child(plugin_permission_label(permission))
-        })
-        .collect::<Vec<_>>();
-    let command_buttons = plugin
-        .manifest
-        .commands
-        .iter()
-        .enumerate()
-        .map(|(command_index, command)| {
-            let command_view = cx.entity();
-            let plugin_id = plugin.manifest.id.clone();
-            let command_id = command.id.clone();
-            let command_name = command.name.clone();
-            Button::new(("plugin-command", index * 64 + command_index))
-                .outline()
-                .small()
-                .icon(Icon::new(AppIcon::Play))
-                .label(command.name.clone())
-                .disabled(action_disabled || !enabled)
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    let plugin_id = plugin_id.clone();
-                    let command_id = command_id.clone();
-                    let command_name = command_name.clone();
-                    command_view.update(cx, |view, cx| {
-                        view.execute_plugin_command(plugin_id, command_id, command_name, cx);
-                    });
-                }))
-        })
-        .collect::<Vec<_>>();
 
     div()
-        .h_flex()
-        .items_center()
+        .v_flex()
         .gap_3()
         .rounded_lg()
         .border_1()
@@ -973,92 +1309,75 @@ fn installed_plugin_card(
         .bg(rgb(COLOR_SURFACE))
         .p_4()
         .child(
-            Icon::new(AppIcon::Tool)
-                .size(px(22.))
-                .text_color(rgb(COLOR_TEXT_SECONDARY)),
-        )
-        .child(
             div()
-                .v_flex()
-                .flex_1()
-                .min_w_0()
-                .gap_1()
-                .child(div().font_medium().child(plugin.manifest.name.clone()))
+                .h_flex()
+                .items_center()
+                .gap_3()
                 .child(
-                    div()
-                        .text_size(font_px(FONT_SIZE_SM))
-                        .text_color(rgb(COLOR_TEXT_SECONDARY))
-                        .child(plugin.manifest.description.clone()),
+                    Icon::new(AppIcon::Tool)
+                        .size(px(22.))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY)),
                 )
                 .child(
                     div()
-                        .text_size(font_px(FONT_SIZE_XS))
-                        .text_color(rgb(COLOR_TEXT_TERTIARY))
-                        .child(format!(
-                            "{} · v{} · {}",
-                            plugin.manifest.publisher,
-                            plugin.manifest.version,
-                            if plugin.source == "builtin" {
-                                "内置"
-                            } else {
-                                "本地安装"
-                            }
-                        )),
+                        .v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .font_medium()
+                                .child(plugin_display_name(&plugin.manifest)),
+                        )
+                        .child(
+                            div()
+                                .text_size(font_px(FONT_SIZE_SM))
+                                .text_color(rgb(COLOR_TEXT_SECONDARY))
+                                .child(plugin_description(&plugin.manifest)),
+                        )
+                        .child(
+                            div()
+                                .text_size(font_px(FONT_SIZE_XS))
+                                .text_color(rgb(COLOR_TEXT_TERTIARY))
+                                .child(format!(
+                                    "{} · {} · {}",
+                                    plugin.manifest.name,
+                                    plugin_version(&plugin.manifest),
+                                    plugin_source_label(&plugin.source)
+                                )),
+                        ),
                 )
-                .when(!plugin.manifest.permissions.is_empty(), |details| {
-                    details.child(
-                        div()
-                            .h_flex()
-                            .flex_wrap()
-                            .gap_1()
-                            .children(permission_badges),
-                    )
-                })
-                .when(!unavailable_summary.is_empty(), |details| {
-                    details.child(
-                        div()
-                            .text_size(font_px(FONT_SIZE_XS))
-                            .text_color(rgb(COLOR_WARNING))
-                            .child(format!("能力宿主未提供：{unavailable_summary}")),
-                    )
-                }),
+                .child(
+                    settings_action_button(("plugin-toggle", index), cx)
+                        .label(if enabled { "禁用" } else { "启用" })
+                        .disabled(action_disabled)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let plugin_id = plugin_id.clone();
+                            toggle_view.update(cx, |view, cx| {
+                                view.set_plugin_enabled(plugin_id, !enabled, cx);
+                            });
+                        })),
+                )
+                .child(
+                    settings_danger_action_button(("plugin-uninstall", index), cx)
+                        .label(if pending_uninstall == Some(uninstall_id.as_str()) {
+                            "确认卸载"
+                        } else {
+                            "卸载"
+                        })
+                        .disabled(action_disabled)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let plugin_id = uninstall_id.clone();
+                            uninstall_view.update(cx, |view, cx| {
+                                view.uninstall_plugin(plugin_id, cx);
+                            });
+                        })),
+                ),
         )
-        .children(command_buttons)
-        .child(
-            Button::new(("plugin-toggle", index))
-                .outline()
-                .small()
-                .label(if enabled { "禁用" } else { "启用" })
-                .disabled(action_disabled)
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    let plugin_id = plugin_id.clone();
-                    toggle_view.update(cx, |view, cx| {
-                        view.set_plugin_enabled(plugin_id, !enabled, cx);
-                    });
-                })),
-        )
-        .when(plugin.source != "builtin", |card| {
-            card.child(
-                Button::new(("plugin-uninstall", index))
-                    .danger()
-                    .small()
-                    .label(if pending_uninstall == Some(uninstall_id.as_str()) {
-                        "确认卸载"
-                    } else {
-                        "卸载"
-                    })
-                    .disabled(action_disabled)
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        let plugin_id = uninstall_id.clone();
-                        uninstall_view.update(cx, |view, cx| {
-                            view.uninstall_plugin(plugin_id, cx);
-                        });
-                    })),
-            )
-        })
+        .child(component_summary(&plugin.components))
+        .child(provider_compatibility_rows(&plugin.provider_compatibility))
 }
 
-#[allow(clippy::too_many_lines)]
 fn plugin_marketplace_row(
     index: usize,
     entry: &corbit_client::PluginMarketplaceEntry,
@@ -1069,50 +1388,19 @@ fn plugin_marketplace_row(
     cx: &mut Context<ConnectionView>,
 ) -> Div {
     let install_view = cx.entity();
-    let plugin_id = entry.manifest.id.clone();
-    let version = entry.manifest.version.clone();
-    let is_update = entry.update_available;
-    let permission_escalation = entry.permission_escalation.clone();
-    let permission_summary = entry
-        .manifest
-        .permissions
-        .iter()
-        .map(plugin_permission_label)
-        .collect::<Vec<_>>()
-        .join("、");
-    let escalation_summary = entry
-        .permission_escalation
-        .iter()
-        .map(plugin_permission_label)
-        .collect::<Vec<_>>()
-        .join("、");
-    let unavailable_summary = entry
-        .unavailable_permissions
-        .iter()
-        .map(plugin_permission_label)
-        .collect::<Vec<_>>()
-        .join("、");
-    let update_confirmation_pending =
-        pending_update == Some(entry.manifest.id.as_str()) && !permission_escalation.is_empty();
-    let availability_label = if entry.update_available {
-        format!(
-            "{} → {}",
-            entry.installed_version.as_deref().unwrap_or("未知版本"),
-            entry.manifest.version
-        )
-    } else if let Some(version) = entry.installed_version.as_deref() {
-        format!("已安装 {version}")
-    } else if entry.verified {
-        format!("已验证 {}", entry.manifest.version)
-    } else {
-        "不可用".to_owned()
-    };
+    let plugin_id = entry.plugin_id.clone();
+    let version = plugin_source_version(&entry.source);
+    let is_update = entry.installed;
+    let update_confirmation_pending = pending_update == Some(entry.plugin_id.as_str());
     let can_install = supported
         && is_online
         && !operation_in_flight
-        && entry.verified
-        && (!entry.installed || entry.update_available)
-        && entry.package_url.is_some();
+        && entry.compatible
+        && !matches!(
+            entry.policy.installation,
+            corbit_client::PluginInstallationPolicy::NotAvailable
+        );
+
     div()
         .h_flex()
         .items_center()
@@ -1129,57 +1417,43 @@ fn plugin_marketplace_row(
                 .flex_1()
                 .min_w_0()
                 .gap_1()
-                .child(entry.manifest.name.clone())
+                .child(entry.name.clone())
                 .child(
                     div()
                         .text_size(font_px(FONT_SIZE_XS))
                         .text_color(rgb(COLOR_TEXT_TERTIARY))
-                        .child(format!("目标版本 v{}", entry.manifest.version)),
+                        .child(format!(
+                            "{} · {}{}",
+                            entry.category,
+                            plugin_source_label(&entry.source),
+                            entry
+                                .installed_version
+                                .as_deref()
+                                .map_or_else(String::new, |version| format!(
+                                    " · 已安装 v{version}"
+                                ))
+                        )),
                 )
-                .when(!permission_summary.is_empty(), |details| {
-                    details.child(
-                        div()
-                            .text_size(font_px(FONT_SIZE_XS))
-                            .text_color(rgb(COLOR_TEXT_TERTIARY))
-                            .child(format!("权限：{permission_summary}")),
-                    )
-                })
-                .when(!escalation_summary.is_empty(), |details| {
+                .when_some(entry.incompatibility_reason.clone(), |details, reason| {
                     details.child(
                         div()
                             .text_size(font_px(FONT_SIZE_XS))
                             .text_color(rgb(COLOR_WARNING))
-                            .child(format!("更新新增权限：{escalation_summary}")),
-                    )
-                })
-                .when(!unavailable_summary.is_empty(), |details| {
-                    details.child(
-                        div()
-                            .text_size(font_px(FONT_SIZE_XS))
-                            .text_color(rgb(COLOR_WARNING))
-                            .child(format!("当前 Daemon 未提供能力宿主：{unavailable_summary}")),
+                            .child(reason),
                     )
                 }),
         )
-        .child(
-            div()
-                .text_size(font_px(FONT_SIZE_XS))
-                .text_color(rgb(COLOR_TEXT_TERTIARY))
-                .child(availability_label),
-        )
         .when(can_install, |row| {
             row.child(
-                Button::new(("plugin-marketplace-install", index))
-                    .primary()
-                    .small()
-                    .icon(Icon::new(if entry.update_available {
+                settings_primary_action_button(("plugin-marketplace-install", index), cx)
+                    .icon(Icon::new(if is_update {
                         AppIcon::Refresh
                     } else {
                         AppIcon::Add
                     }))
                     .label(if update_confirmation_pending {
                         "确认更新"
-                    } else if entry.update_available {
+                    } else if is_update {
                         "更新"
                     } else {
                         "安装"
@@ -1187,170 +1461,186 @@ fn plugin_marketplace_row(
                     .on_click(cx.listener(move |_, _, _, cx| {
                         let plugin_id = plugin_id.clone();
                         let version = version.clone();
-                        let permission_escalation = permission_escalation.clone();
                         install_view.update(cx, |view, cx| {
-                            view.install_marketplace_plugin(
-                                plugin_id,
-                                version,
-                                is_update,
-                                &permission_escalation,
-                                cx,
-                            );
+                            view.install_marketplace_plugin(plugin_id, version, is_update, cx);
                         });
                     })),
             )
         })
 }
 
-const fn plugin_permission_label(permission: &corbit_client::PluginPermission) -> &'static str {
-    match permission {
-        corbit_client::PluginPermission::WorkspaceRead => "工作区只读",
-        corbit_client::PluginPermission::WorkspaceWrite => "工作区写入",
-        corbit_client::PluginPermission::Network => "网络访问",
-        corbit_client::PluginPermission::Process => "进程执行",
-        corbit_client::PluginPermission::Secrets => "敏感信息",
+fn component_summary(components: &corbit_client::PluginComponents) -> Div {
+    let mut parts = vec![format!("Skills {}", components.skill_count)];
+    parts.push(format!("MCP {}", components.mcp_server_names.len()));
+    if components.has_hooks {
+        parts.push("Hooks".into());
+    }
+    if components.has_apps {
+        parts.push("Apps".into());
+    }
+    div()
+        .text_size(font_px(FONT_SIZE_XS))
+        .text_color(rgb(COLOR_TEXT_TERTIARY))
+        .child(parts.join(" · "))
+}
+
+fn provider_compatibility_rows(compatibility: &corbit_client::PluginProviderCompatibility) -> Div {
+    div()
+        .h_flex()
+        .flex_wrap()
+        .gap_2()
+        .child(compatibility_badge("Codex", &compatibility.codex))
+        .child(compatibility_badge("Claude", &compatibility.claude))
+        .child(compatibility_badge("ACP", &compatibility.acp))
+}
+
+fn compatibility_badge(
+    provider: &'static str,
+    compatibility: &corbit_client::PluginProviderCompatibilityEntry,
+) -> Div {
+    let (label, color) = match compatibility.status {
+        corbit_client::PluginProviderCompatibilityStatus::Full => ("完整", COLOR_SUCCESS),
+        corbit_client::PluginProviderCompatibilityStatus::Partial => ("部分", COLOR_WARNING),
+        corbit_client::PluginProviderCompatibilityStatus::Unsupported => ("不支持", COLOR_ERROR),
+    };
+    div()
+        .flex_none()
+        .rounded_full()
+        .bg(rgb(COLOR_SURFACE_SECONDARY))
+        .px_2()
+        .py_1()
+        .text_size(font_px(FONT_SIZE_XS))
+        .text_color(rgb(color))
+        .child(format!("{provider} {label}"))
+}
+
+fn plugin_display_name(manifest: &corbit_client::PluginManifest) -> String {
+    manifest
+        .interface
+        .as_ref()
+        .and_then(|interface| interface.display_name.clone())
+        .unwrap_or_else(|| manifest.name.clone())
+}
+
+fn plugin_description(manifest: &corbit_client::PluginManifest) -> String {
+    manifest
+        .description
+        .clone()
+        .unwrap_or_else(|| "未提供描述".into())
+}
+
+fn plugin_version(manifest: &corbit_client::PluginManifest) -> String {
+    manifest
+        .version
+        .as_ref()
+        .map_or_else(|| "未声明".into(), |version| format!("v{version}"))
+}
+
+fn plugin_author(manifest: &corbit_client::PluginManifest) -> String {
+    manifest
+        .author
+        .as_ref()
+        .map_or_else(|| "未声明".into(), |author| author.name.clone())
+}
+
+fn plugin_source_label(source: &corbit_client::PluginSource) -> &'static str {
+    match source {
+        corbit_client::PluginSource::Local { .. } => "本地目录",
+        corbit_client::PluginSource::Git { .. } => "Git",
+        corbit_client::PluginSource::Npm { .. } => "NPM",
     }
 }
 
-fn unavailable_permission_labels(
-    permissions: &[corbit_client::PluginPermission],
-) -> Vec<&'static str> {
-    permissions.iter().map(plugin_permission_label).collect()
-}
-
-fn plugin_permissions_require_workspace_write(
-    permissions: &[corbit_client::PluginPermission],
-) -> bool {
-    permissions.contains(&corbit_client::PluginPermission::WorkspaceWrite)
-}
-
-fn plugin_write_approval_key(plugin_id: &str, command_id: &str, workspace_id: &str) -> String {
-    format!("{plugin_id}:{command_id}:{workspace_id}")
-}
-
-fn plugin_capability_label(capability: &str) -> &str {
-    match capability {
-        "workspace.list" => "目录列表",
-        "workspace.read" => "文件读取",
-        "workspace.write" => "文件写入",
-        "workspace.git.status" => "Git 状态",
-        "workspace.git.diff" => "Git 差异",
-        _ => capability,
+fn plugin_source_version(source: &corbit_client::PluginSource) -> Option<String> {
+    match source {
+        corbit_client::PluginSource::Npm { version, .. } => version.clone(),
+        corbit_client::PluginSource::Local { .. } | corbit_client::PluginSource::Git { .. } => None,
     }
-}
-
-fn plugin_capability_usage_summary(
-    usage: &[corbit_client::PluginCapabilityUsage],
-) -> Option<String> {
-    if usage.is_empty() {
-        return None;
-    }
-    let mut parts = usage
-        .iter()
-        .take(3)
-        .map(|item| {
-            let failure = if item.failure_count == 0 {
-                String::new()
-            } else {
-                format!("，失败 {} 次", item.failure_count)
-            };
-            format!(
-                "{} {} 次{failure}",
-                plugin_capability_label(&item.capability),
-                item.request_count
-            )
-        })
-        .collect::<Vec<_>>();
-    if usage.len() > 3 {
-        parts.push(format!("另 {} 项", usage.len() - 3));
-    }
-    Some(format!("能力调用：{}", parts.join("；")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        plugin_capability_usage_summary, plugin_permission_label,
-        plugin_permissions_require_workspace_write, plugin_write_approval_key,
-        unavailable_permission_labels,
+        official_plugin_display_name, official_plugin_matches, plugin_display_name,
+        plugin_source_label, plugin_source_version,
     };
-    use corbit_client::{PluginCapabilityUsage, PluginPermission};
+    use corbit_client::{
+        CodexOfficialPluginInterface, CodexOfficialPluginSummary, PluginInterface, PluginManifest,
+        PluginSource,
+    };
 
     #[test]
-    fn plugin_permissions_have_explicit_user_facing_labels() {
-        assert_eq!(
-            [
-                PluginPermission::WorkspaceRead,
-                PluginPermission::WorkspaceWrite,
-                PluginPermission::Network,
-                PluginPermission::Process,
-                PluginPermission::Secrets,
-            ]
-            .iter()
-            .map(plugin_permission_label)
-            .collect::<Vec<_>>(),
-            [
-                "工作区只读",
-                "工作区写入",
-                "网络访问",
-                "进程执行",
-                "敏感信息"
-            ]
-        );
+    fn plugin_labels_follow_codex_manifest_and_source_metadata() {
+        let manifest = PluginManifest {
+            name: "example.plugin".into(),
+            version: Some("1.0.0".into()),
+            description: Some("Example".into()),
+            author: None,
+            homepage: None,
+            repository: None,
+            license: None,
+            keywords: Vec::new(),
+            skills: Some("./skills".into()),
+            mcp_servers: None,
+            apps: None,
+            hooks: None,
+            interface: Some(PluginInterface {
+                display_name: Some("Example Plugin".into()),
+                short_description: None,
+                long_description: None,
+                developer_name: None,
+                category: None,
+                capabilities: Vec::new(),
+                website_url: None,
+                privacy_policy_url: None,
+                terms_of_service_url: None,
+                default_prompt: Vec::new(),
+                brand_color: None,
+                composer_icon: None,
+                logo: None,
+                screenshots: Vec::new(),
+            }),
+        };
+        let source = PluginSource::Npm {
+            package: "@example/plugin".into(),
+            version: Some("1.0.0".into()),
+            registry: None,
+        };
+
+        assert_eq!(plugin_display_name(&manifest), "Example Plugin");
+        assert_eq!(plugin_source_label(&source), "NPM");
+        assert_eq!(plugin_source_version(&source).as_deref(), Some("1.0.0"));
     }
 
     #[test]
-    fn plugin_unavailable_permissions_follow_the_daemon_response() {
-        assert_eq!(
-            unavailable_permission_labels(&[PluginPermission::Network, PluginPermission::Secrets,]),
-            vec!["网络访问", "敏感信息"]
-        );
-    }
+    fn official_plugin_search_covers_catalog_and_interface_metadata() {
+        let plugin = CodexOfficialPluginSummary {
+            id: "plugin_gmail".into(),
+            name: "gmail".into(),
+            installed: false,
+            enabled: false,
+            source_type: "remote".into(),
+            availability: "AVAILABLE".into(),
+            install_policy: "AVAILABLE".into(),
+            auth_policy: "ON_INSTALL".into(),
+            version: Some("0.1.3".into()),
+            local_version: None,
+            keywords: vec!["email".into()],
+            must_show_installation_interstitial: Some(true),
+            interface: Some(CodexOfficialPluginInterface {
+                display_name: Some("Gmail".into()),
+                short_description: Some("Read and manage Gmail".into()),
+                developer_name: Some("OpenAI".into()),
+                category: Some("Communication".into()),
+                ..CodexOfficialPluginInterface::default()
+            }),
+        };
 
-    #[test]
-    fn plugin_workspace_write_requires_an_explicit_command_approval() {
-        assert!(plugin_permissions_require_workspace_write(&[
-            PluginPermission::WorkspaceRead,
-            PluginPermission::WorkspaceWrite,
-        ]));
-        assert!(!plugin_permissions_require_workspace_write(&[
-            PluginPermission::WorkspaceRead,
-            PluginPermission::Network,
-        ]));
-    }
-
-    #[test]
-    fn plugin_workspace_write_approval_is_bound_to_the_selected_workspace() {
-        let main = plugin_write_approval_key("com.example.writer", "writer.run", "workspace_main");
-        let docs = plugin_write_approval_key("com.example.writer", "writer.run", "workspace_docs");
-
-        assert_ne!(main, docs);
-        assert_eq!(
-            main,
-            plugin_write_approval_key("com.example.writer", "writer.run", "workspace_main")
-        );
-    }
-
-    #[test]
-    fn capability_summary_exposes_counts_without_request_parameters() {
-        let summary = plugin_capability_usage_summary(&[
-            PluginCapabilityUsage {
-                capability: "workspace.read".into(),
-                request_count: 2,
-                success_count: 1,
-                failure_count: 1,
-            },
-            PluginCapabilityUsage {
-                capability: "workspace.git.status".into(),
-                request_count: 1,
-                success_count: 1,
-                failure_count: 0,
-            },
-        ]);
-
-        assert_eq!(
-            summary.as_deref(),
-            Some("能力调用：文件读取 2 次，失败 1 次；Git 状态 1 次")
-        );
+        assert_eq!(official_plugin_display_name(&plugin), "Gmail");
+        assert!(official_plugin_matches(&plugin, "gmail"));
+        assert!(official_plugin_matches(&plugin, "manage"));
+        assert!(official_plugin_matches(&plugin, "communication"));
+        assert!(official_plugin_matches(&plugin, "email"));
+        assert!(!official_plugin_matches(&plugin, "calendar"));
     }
 }

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use super::ComposerAttachment;
 
-pub(super) const MAX_PROMPT_ATTACHMENTS: usize = 3;
+pub(in crate::app) const MAX_PROMPT_ATTACHMENTS: usize = 3;
 const MAX_PROMPT_ATTACHMENT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROMPT_ATTACHMENTS_TOTAL_BYTES: usize = 5 * 1024 * 1024;
 
@@ -34,7 +34,7 @@ pub(super) fn permission_mode_copy(mode: corbit_client::AgentPermissionMode) -> 
         },
         corbit_client::AgentPermissionMode::WorkspaceWrite => PermissionModeCopy {
             title: "帮我批准",
-            description: "仅对检测到的风险操作请求批准",
+            description: "自动审查低风险权限请求，高风险操作仍会询问",
         },
         corbit_client::AgentPermissionMode::FullAccess => PermissionModeCopy {
             title: "完全访问权限",
@@ -47,7 +47,7 @@ pub(super) fn attachment_size_label(size: usize) -> String {
     format!("{} KB", size.div_ceil(1024))
 }
 
-pub(super) fn load_prompt_attachments(
+pub(in crate::app) fn load_prompt_attachments(
     paths: Vec<PathBuf>,
     available_slots: usize,
     existing_bytes: usize,

@@ -6,10 +6,12 @@ use std::{
 
 use corbit_protocol::{
     AgentApprovalDecision, AgentApprovalResolveAcknowledgement, AgentInterruptAcknowledgement,
-    AgentPermissionPayload, AgentPromptAcknowledgement, AgentPromptOptions, AgentTimelinePayload,
-    AuthoritativeSnapshot, ClientMessage, DeviceCredentialSummary, DeviceListResponse,
-    EventSyncPhase, HealthResponse, PROTOCOL_VERSION, PairingOffer, ProviderCatalog,
-    ResourceMutationAcknowledgement, ResumeCursor, ServerInfo, ServerMessage, WorkspaceChanged,
+    AgentPermissionPayload, AgentPromptAcknowledgement, AgentPromptOptions,
+    AgentSteerAcknowledgement, AgentTimelinePayload, AuthoritativeSnapshot, ClientMessage,
+    DeviceCredentialSummary, DeviceListResponse, EventSyncPhase, HealthResponse, PROTOCOL_VERSION,
+    PairingOffer, ProviderCatalog, ResourceMutationAcknowledgement, ResumeCursor, ScheduledRun,
+    ScheduledTask, ScheduledTaskCreateInput, ScheduledTaskDeleteAcknowledgement,
+    ScheduledTaskUpdateInput, ServerInfo, ServerMessage, WorkspaceChanged,
     WorkspaceDirectoryListing, WorkspaceFileContent, WorkspaceGitDiff, WorkspaceGitStatus,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -701,6 +703,97 @@ impl CorbitConnection {
         serde_json::from_value(value).map_err(Into::into)
     }
 
+    /// Lists all active and paused scheduled tasks.
+    pub async fn scheduled_tasks(&self) -> Result<Vec<ScheduledTask>, ClientError> {
+        let value = self.rpc("schedule.list", None).await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Creates one unattended scheduled task.
+    pub async fn create_scheduled_task(
+        &self,
+        input: ScheduledTaskCreateInput,
+    ) -> Result<ScheduledTask, ClientError> {
+        let value = self
+            .rpc("schedule.create", Some(serde_json::to_value(input)?))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Updates one scheduled task.
+    pub async fn update_scheduled_task(
+        &self,
+        input: ScheduledTaskUpdateInput,
+    ) -> Result<ScheduledTask, ClientError> {
+        let value = self
+            .rpc("schedule.update", Some(serde_json::to_value(input)?))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Pauses or resumes one scheduled task.
+    pub async fn set_scheduled_task_paused(
+        &self,
+        task_id: &str,
+        paused: bool,
+    ) -> Result<ScheduledTask, ClientError> {
+        let value = self
+            .rpc(
+                if paused {
+                    "schedule.pause"
+                } else {
+                    "schedule.resume"
+                },
+                Some(serde_json::json!({ "taskId": task_id })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Deletes one scheduled task.
+    pub async fn delete_scheduled_task(
+        &self,
+        task_id: &str,
+    ) -> Result<ScheduledTaskDeleteAcknowledgement, ClientError> {
+        let value = self
+            .rpc(
+                "schedule.delete",
+                Some(serde_json::json!({ "taskId": task_id })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Starts one scheduled task immediately.
+    pub async fn run_scheduled_task_now(&self, task_id: &str) -> Result<ScheduledRun, ClientError> {
+        let value = self
+            .rpc(
+                "schedule.runNow",
+                Some(serde_json::json!({ "taskId": task_id })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Lists recent scheduled task runs.
+    pub async fn scheduled_runs(
+        &self,
+        task_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<ScheduledRun>, ClientError> {
+        let mut params = serde_json::Map::new();
+        if let Some(task_id) = task_id {
+            params.insert("taskId".into(), Value::String(task_id.into()));
+        }
+        if let Some(limit) = limit {
+            params.insert("limit".into(), Value::from(limit));
+        }
+        let value = self
+            .rpc("schedule.run.list", Some(Value::Object(params)))
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
     /// Lists one directory relative to the selected workspace root.
     ///
     /// # Errors
@@ -879,6 +972,34 @@ impl CorbitConnection {
                 Some(serde_json::json!({
                     "agentId": agent_id,
                     "turnId": turn_id,
+                    "clientMutationId": client_mutation_id,
+                })),
+            )
+            .await?;
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    /// Steers one active Agent turn.
+    ///
+    /// The caller must reuse `client_mutation_id` when retrying an ambiguous result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the RPC fails or its acknowledgement is malformed.
+    pub async fn steer(
+        &self,
+        agent_id: &str,
+        turn_id: &str,
+        text: &str,
+        client_mutation_id: &str,
+    ) -> Result<AgentSteerAcknowledgement, ClientError> {
+        let value = self
+            .rpc(
+                "agent.steer",
+                Some(serde_json::json!({
+                    "agentId": agent_id,
+                    "turnId": turn_id,
+                    "text": text,
                     "clientMutationId": client_mutation_id,
                 })),
             )
