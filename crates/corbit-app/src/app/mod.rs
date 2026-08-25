@@ -1,4 +1,5 @@
 mod appearance;
+mod application_icon;
 mod branding;
 mod build_info;
 mod coding;
@@ -27,10 +28,10 @@ mod ui_state;
 mod workspace;
 
 use appearance::{
-    AppearancePreferences, CodeFont, CodeTextSize, ColorScheme, ContentWidth, ContrastLevel,
-    InterfaceFont, InterfaceTextSize,
+    AppIconMode, AppearancePreferences, CodeFont, CodeTextSize, ColorScheme, ContentWidth,
+    ContrastLevel, InterfaceFont, InterfaceTextSize,
 };
-use branding::{AppIcon, BrandAssets, brand_mark};
+use branding::{APP_ICON_DARK_ASSET, APP_ICON_LIGHT_ASSET, AppIcon, BrandAssets, brand_mark};
 use coding::{CodingPreferences, SshConnectionTestState, detect_git_version};
 use connection::{ConnectionPreferences, CredentialSource};
 use discovery::{ActivityFilter, SearchScope};
@@ -73,7 +74,7 @@ use workspace::{
 
 use gpui::{
     Animation, AnimationExt, AnyElement, App, AppContext, Application, ClipboardItem, Context,
-    Corner, Div, Entity, FontWeight, IntoElement, KeyBinding, ListAlignment, ListState,
+    Corner, Div, Entity, FontWeight, IntoElement, KeyBinding, ListAlignment, ListState, ObjectFit,
     PathPromptOptions, Render, SharedString, Subscription, Task, Timer, Window,
     WindowBackgroundAppearance, WindowOptions, canvas, div, img, list, percentage, prelude::*, px,
     rems, rgb as gpui_rgb,
@@ -267,6 +268,7 @@ struct ConnectionView {
     composer_selections: ComposerSelections,
     composer_permission_mode: corbit_client::AgentPermissionMode,
     prompt_attachments: Vec<ComposerAttachment>,
+    clipboard_image_sequence: usize,
     queued_prompts: VecDeque<QueuedPrompt>,
     attachment_in_flight: bool,
     new_task_clear_requested: bool,
@@ -418,6 +420,7 @@ impl ConnectionView {
                 .placeholder("向 Corbit 提问或描述任务…")
                 .default_value(prompt_draft)
                 .auto_grow(2, 6)
+                .intercept_paste(true)
         });
         let appearance_theme_code =
             cx.new(|cx| InputState::new(window, cx).placeholder("粘贴 Corbit 外观配置 JSON"));
@@ -482,6 +485,9 @@ impl ConnectionView {
             &prompt_input,
             window,
             |view, input, event: &InputEvent, window, cx| match event {
+                InputEvent::Paste(clipboard) => {
+                    view.paste_prompt_clipboard(input, clipboard, window, cx);
+                }
                 InputEvent::Change | InputEvent::PressEnter { secondary: true } => {
                     if let Some(agent_id) = view.prompt_input_agent_id.clone() {
                         let value = input.read(cx).value().to_string();
@@ -522,6 +528,11 @@ impl ConnectionView {
         subscriptions.push(cx.observe_window_appearance(window, |view, window, cx| {
             if view.appearance.color_scheme == ColorScheme::System {
                 configure_codex_theme(view.appearance, Some(window), cx);
+                if let Err(error) =
+                    application_icon::apply(view.appearance.app_icon_mode, is_dark_mode())
+                {
+                    view.appearance_error = Some(error.to_string());
+                }
                 cx.notify();
             }
         }));
@@ -743,6 +754,7 @@ impl ConnectionView {
             composer_selections,
             composer_permission_mode,
             prompt_attachments: Vec::new(),
+            clipboard_image_sequence: 0,
             queued_prompts: VecDeque::new(),
             attachment_in_flight: false,
             new_task_clear_requested: false,
@@ -1895,6 +1907,9 @@ fn show_main_window(cx: &mut App) -> anyhow::Result<()> {
     let appearance = AppearancePreferences::load();
     let ui_preferences = UiPreferences::load();
     configure_codex_theme(appearance, None, cx);
+    if let Err(error) = application_icon::apply(appearance.app_icon_mode, is_dark_mode()) {
+        eprintln!("Failed to apply Corbit application icon: {error:#}");
+    }
     let window_options = corbit_window_options(appearance, ui_preferences.window);
     let window_handle = cx.open_window(window_options, |window, cx| {
         let view = cx.new(|cx| ConnectionView::new(window, cx, appearance, ui_preferences));

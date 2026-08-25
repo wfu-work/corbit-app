@@ -82,7 +82,7 @@ Corbit App 负责桌面交互、窗口和本地展示状态。Agent 生命周期
     `.codex-plugin/plugin.json` 的目录，不再接收旧 Corbit 清单或压缩包；安装前使用五分钟
     有效的一次性预检令牌，并展示名称、版本、作者、目录指纹、Skills、MCP、Hooks、Apps
     以及 Codex/Claude/ACP 兼容性。插件市场读取官方 `.agents/plugins/marketplace.json`
-    结构，支持 local、Git、Git 子目录和 NPM source。启用插件后，Daemon 将 Skills/MCP
+    结构，默认展示固定版本的 OpenAI 公开 Skills 插件，也支持 local、Git、Git 子目录和 NPM source。启用插件后，Daemon 将 Skills/MCP
     分别适配并注入 Codex App Server、Claude Agent SDK 和 ACP；Hooks 与 Apps 当前仅展示，
     尚未由 Corbit 托管。安装、更新、启停与卸载均已实现。插件页还会在
     `server_info.features.officialPlugins` 可用时读取 Codex App Server 的账号感知官方目录，
@@ -90,6 +90,8 @@ Corbit App 负责桌面交互、窗口和本地展示状态。Agent 生命周期
     只用于 Codex Provider；OAuth 页面由 Codex 提供，Corbit 不保存第三方 OAuth 凭据。
     OpenAI 当前仍将 App Server 的 `plugin/list`、`plugin/install` 和 `plugin/uninstall`
     标记为开发中，因此该区域按实验性能力展示，失败不会影响本地插件管理。
+    默认公开快照不包含 Gmail、Slack、Notion 等需要 Codex 托管 OAuth/App 的连接器；配置
+    `CORBIT_PLUGIN_MARKETPLACE_URL` 后可用自定义 marketplace.json 替换内置条目。
 
 协议由 `corbit-daemon` 工程维护。桌面端不得自行增加仅有 Rust 能理解的线协议字段。
 

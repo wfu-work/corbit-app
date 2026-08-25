@@ -8,6 +8,8 @@ use super::theme::is_dark_mode;
 pub(crate) const MARK_ASSET: &str = "brand/corbit-mark.svg";
 pub(crate) const SYMBOL_LIGHT_ASSET: &str = "brand/corbit-symbol-light.svg";
 pub(crate) const SYMBOL_DARK_ASSET: &str = "brand/corbit-symbol-dark.svg";
+pub(crate) const APP_ICON_LIGHT_ASSET: &str = "brand/corbit-app-icon.svg";
+pub(crate) const APP_ICON_DARK_ASSET: &str = "brand/corbit-app-icon-dark.svg";
 pub(crate) const CODEX_PROVIDER_ASSET: &str = "providers/codex.svg";
 pub(crate) const CLAUDE_PROVIDER_ASSET: &str = "providers/claude.svg";
 
@@ -48,6 +50,20 @@ const EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
         )),
     ),
     (
+        APP_ICON_LIGHT_ASSET,
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/brand/corbit-app-icon.svg"
+        )),
+    ),
+    (
+        APP_ICON_DARK_ASSET,
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../assets/brand/corbit-app-icon-dark.svg"
+        )),
+    ),
+    (
         CODEX_PROVIDER_ASSET,
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -77,6 +93,7 @@ const EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     embedded_icon!("copy"),
     embedded_icon!("external-link"),
     embedded_icon!("file"),
+    embedded_icon!("file-search"),
     embedded_icon!("folder-closed"),
     embedded_icon!("folder-open"),
     embedded_icon!("git-compare-arrows"),
@@ -88,6 +105,7 @@ const EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     embedded_icon!("message-square"),
     embedded_icon!("monitor-smartphone"),
     embedded_icon!("more-horizontal"),
+    embedded_icon!("notebook-tabs"),
     embedded_icon!("panel-left-close"),
     embedded_icon!("panel-left-open"),
     embedded_icon!("panels-top-left"),
@@ -130,12 +148,14 @@ pub(crate) enum AppIcon {
     Device,
     ExternalLink,
     File,
+    FileSearch,
     Folder,
     FolderOpen,
     Git,
     Hook,
     Info,
     More,
+    Notebook,
     Notification,
     PanelLeftClose,
     PanelLeftOpen,
@@ -181,12 +201,14 @@ impl AppIcon {
         Self::Device,
         Self::ExternalLink,
         Self::File,
+        Self::FileSearch,
         Self::Folder,
         Self::FolderOpen,
         Self::Git,
         Self::Hook,
         Self::Info,
         Self::More,
+        Self::Notebook,
         Self::Notification,
         Self::PanelLeftClose,
         Self::PanelLeftOpen,
@@ -231,12 +253,14 @@ impl AppIcon {
             Self::Device => "icons/monitor-smartphone.svg",
             Self::ExternalLink => "icons/external-link.svg",
             Self::File => "icons/file.svg",
+            Self::FileSearch => "icons/file-search.svg",
             Self::Folder | Self::Project => "icons/folder-closed.svg",
             Self::FolderOpen => "icons/folder-open.svg",
             Self::Git => "icons/git-branch.svg",
             Self::Hook => "icons/anchor.svg",
             Self::Info => "icons/info.svg",
             Self::More => "icons/more-horizontal.svg",
+            Self::Notebook => "icons/notebook-tabs.svg",
             Self::Notification => "icons/bell.svg",
             Self::PanelLeftClose => "icons/panel-left-close.svg",
             Self::PanelLeftOpen => "icons/panel-left-open.svg",
@@ -364,8 +388,20 @@ mod tests {
                 SharedString::from(MARK_ASSET),
                 SharedString::from(SYMBOL_LIGHT_ASSET),
                 SharedString::from(SYMBOL_DARK_ASSET),
+                SharedString::from(APP_ICON_LIGHT_ASSET),
+                SharedString::from(APP_ICON_DARK_ASSET),
             ]
         );
+        for path in [APP_ICON_LIGHT_ASSET, APP_ICON_DARK_ASSET] {
+            let icon = assets
+                .load(path)
+                .expect("app icon asset lookup should succeed")
+                .unwrap_or_else(|| panic!("{path} should be embedded"));
+            assert!(
+                icon.windows(b"<svg".len()).any(|window| window == b"<svg"),
+                "{path} should be an SVG"
+            );
+        }
         assert!(
             assets
                 .load("brand/missing.svg")

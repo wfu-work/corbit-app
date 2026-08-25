@@ -1076,6 +1076,7 @@ dependencies = [
  "base64",
  "chrono",
  "corbit-client",
+ "corbit-macos-interop",
  "gpui",
  "gpui-component",
  "image",
@@ -1107,6 +1108,15 @@ dependencies = [
  "tokio-tungstenite",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "corbit-macos-interop"
+version = "0.1.0"
+dependencies = [
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
 ]
 
 [[package]]

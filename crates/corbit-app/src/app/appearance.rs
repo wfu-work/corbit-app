@@ -33,6 +33,35 @@ impl ColorScheme {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub(super) enum AppIconMode {
+    #[default]
+    FollowAppearance,
+    Light,
+    Dark,
+}
+
+impl AppIconMode {
+    pub(super) const ALL: [Self; 3] = [Self::FollowAppearance, Self::Light, Self::Dark];
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::FollowAppearance => "跟随外观",
+            Self::Light => "浅色图标",
+            Self::Dark => "深色图标",
+        }
+    }
+
+    pub(super) const fn resolves_to_dark(self, appearance_is_dark: bool) -> bool {
+        match self {
+            Self::FollowAppearance => appearance_is_dark,
+            Self::Light => false,
+            Self::Dark => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(super) enum ContrastLevel {
     Soft,
     #[default]
@@ -181,6 +210,7 @@ impl ContentWidth {
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct AppearancePreferences {
     pub(super) color_scheme: ColorScheme,
+    pub(super) app_icon_mode: AppIconMode,
     #[serde(with = "hex_color")]
     pub(super) accent_color: u32,
     #[serde(with = "hex_color")]
@@ -204,6 +234,7 @@ impl Default for AppearancePreferences {
     fn default() -> Self {
         Self {
             color_scheme: ColorScheme::System,
+            app_icon_mode: AppIconMode::FollowAppearance,
             accent_color: 0x33_9cff,
             light_background: 0xff_ffff,
             light_foreground: 0x1a_1c1f,
@@ -350,6 +381,7 @@ mod tests {
         let path = directory.join("appearance.json");
         let preferences = AppearancePreferences {
             color_scheme: ColorScheme::Dark,
+            app_icon_mode: AppIconMode::Dark,
             accent_color: 0x8b_5cf6,
             contrast: ContrastLevel::Strong,
             translucent_sidebar: false,
@@ -411,5 +443,22 @@ mod tests {
             AppearancePreferences::from_share_code(&shared).expect("theme should deserialize"),
             preferences
         );
+    }
+
+    #[test]
+    fn app_icon_mode_serializes_and_resolves_follow_appearance() {
+        assert_eq!(
+            serde_json::to_string(&AppIconMode::FollowAppearance)
+                .expect("icon mode should serialize"),
+            r#""follow_appearance""#
+        );
+        assert_eq!(
+            serde_json::from_str::<AppIconMode>(r#""dark""#).expect("icon mode should deserialize"),
+            AppIconMode::Dark
+        );
+        assert!(!AppIconMode::FollowAppearance.resolves_to_dark(false));
+        assert!(AppIconMode::FollowAppearance.resolves_to_dark(true));
+        assert!(!AppIconMode::Light.resolves_to_dark(true));
+        assert!(AppIconMode::Dark.resolves_to_dark(false));
     }
 }

@@ -790,7 +790,7 @@ impl ConnectionView {
                         .line_height(px(19.))
                         .text_color(rgb(COLOR_TEXT_SECONDARY))
                         .child(
-                            "读取官方 marketplace.json 结构，支持本地、Git 子目录和 NPM 来源。",
+                            "默认展示固定版本的 OpenAI 公开 Skills 插件；也支持通过 CORBIT_PLUGIN_MARKETPLACE_URL 配置自定义 marketplace.json。",
                         ),
                 )
                 .when(self.plugin_marketplace.is_empty(), |card| {
@@ -799,7 +799,7 @@ impl ConnectionView {
                             .py_2()
                             .text_size(font_px(FONT_SIZE_SM))
                             .text_color(rgb(COLOR_TEXT_TERTIARY))
-                            .child("未配置插件市场，或市场当前没有条目。"),
+                            .child("插件市场当前没有条目。"),
                     )
                 })
                 .children(marketplace_cards),

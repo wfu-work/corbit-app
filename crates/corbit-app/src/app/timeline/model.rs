@@ -1,11 +1,14 @@
 //! Timeline domain state and the lookup index used by virtualized rendering.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Clone, Debug)]
 pub(in crate::app) struct ComposerAttachment {
     pub(in crate::app) upload: corbit_client::AgentPromptAttachment,
     pub(in crate::app) size_bytes: usize,
+    /// Decoded by GPUI when rendered, so pasted and selected image attachments
+    /// can be shown as a lightweight thumbnail in the composer.
+    pub(in crate::app) preview: Option<Arc<gpui::Image>>,
 }
 
 #[derive(Clone, Debug)]

@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/corbit-app", "crates/corbit-client", "crates/corbit-protocol"]
+members = [
+    "crates/corbit-app",
+    "crates/corbit-client",
+    "crates/corbit-macos-interop",
+    "crates/corbit-protocol",
+]
 exclude = ["vendor/gpui-component"]
 resolver = "3"
 
@@ -16,6 +21,7 @@ async-channel = "2.5.0"
 base64 = "0.22.1"
 chrono = "0.4.45"
 corbit-client = { path = "crates/corbit-client" }
+corbit-macos-interop = { path = "crates/corbit-macos-interop" }
 corbit-protocol = { path = "crates/corbit-protocol" }
 futures-util = "0.3.31"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }

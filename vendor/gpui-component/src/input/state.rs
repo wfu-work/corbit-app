@@ -92,7 +92,11 @@ actions!(
 #[derive(Clone)]
 pub enum InputEvent {
     Change,
-    PressEnter { secondary: bool },
+    PressEnter {
+        secondary: bool,
+    },
+    /// The input is configured to let its owner handle clipboard contents.
+    Paste(ClipboardItem),
     Focus,
     Blur,
 }
@@ -310,6 +314,9 @@ pub struct InputState {
     pub(super) mouse_context_menu: Entity<MouseContextMenu>,
     /// A flag to indicate if we are currently inserting a completion item.
     pub(super) completion_inserting: bool,
+    /// Whether paste events are delegated to the owner instead of being
+    /// inserted as plain text by the input itself.
+    pub(super) intercept_paste: bool,
     pub(super) hover_popover: Option<Entity<HoverPopover>>,
     /// The LSP definitions locations for "Go to Definition" feature.
     pub(super) hover_definition: HoverDefinition,
@@ -403,6 +410,7 @@ impl InputState {
             context_menu: None,
             mouse_context_menu,
             completion_inserting: false,
+            intercept_paste: false,
             hover_popover: None,
             hover_definition: HoverDefinition::default(),
             silent_replace_text: false,
@@ -425,6 +433,15 @@ impl InputState {
     /// Set Input to use [`InputMode::AutoGrow`] mode with min, max rows limit.
     pub fn auto_grow(mut self, min_rows: usize, max_rows: usize) -> Self {
         self.mode = InputMode::auto_grow(min_rows, max_rows);
+        self
+    }
+
+    /// Delegate clipboard contents to [`InputEvent::Paste`].
+    ///
+    /// The event subscriber is responsible for inserting ordinary text when
+    /// the clipboard does not contain an attachment it wants to handle.
+    pub fn intercept_paste(mut self, intercept: bool) -> Self {
+        self.intercept_paste = intercept;
         self
     }
 
@@ -1448,7 +1465,14 @@ impl InputState {
 
     pub(super) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(clipboard) = cx.read_from_clipboard() {
-            let mut new_text = clipboard.text().unwrap_or_default();
+            if self.intercept_paste {
+                cx.emit(InputEvent::Paste(clipboard));
+                return;
+            }
+
+            let Some(mut new_text) = clipboard.text() else {
+                return;
+            };
             if !self.mode.is_multi_line() {
                 new_text = new_text.replace('\n', "");
             }

@@ -1,5 +1,9 @@
 use super::*;
 
+const CODEX_SUGGESTION_TITLE_SIZE: f32 = 15.;
+const CODEX_SUGGESTION_ITEM_SIZE: f32 = 15.;
+const CODEX_SUGGESTION_DESCRIPTION_SIZE: f32 = 13.;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ScheduledFilter {
     All,
@@ -277,6 +281,8 @@ impl ConnectionView {
         title: &'static str,
         prompt: &'static str,
         cadence: ScheduledCadence,
+        time: &'static str,
+        weekday: Option<u8>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -285,7 +291,12 @@ impl ConnectionView {
             .update(cx, |input, cx| input.set_value(title, window, cx));
         self.scheduled_prompt
             .update(cx, |input, cx| input.set_value(prompt, window, cx));
+        self.scheduled_time
+            .update(cx, |input, cx| input.set_value(time, window, cx));
         self.scheduled_cadence = cadence;
+        if let Some(weekday) = weekday {
+            self.scheduled_weekday = weekday;
+        }
         cx.notify();
     }
 
@@ -1146,62 +1157,90 @@ impl ConnectionView {
                         panel.child(
                             div()
                                 .v_flex()
-                                .gap_3()
-                                .rounded_lg()
-                                .border_1()
-                                .border_color(rgb(COLOR_BORDER))
-                                .bg(rgb(COLOR_SURFACE_UNDER))
-                                .p_5()
-                                .child(div().font_medium().child("让 Corbit 按时继续工作"))
+                                .w_full()
+                                .px(px(48.))
+                                .pt(px(18.))
+                                .pb(px(48.))
                                 .child(
                                     div()
-                                        .text_size(font_px(FONT_SIZE_SM))
-                                        .text_color(rgb(COLOR_TEXT_SECONDARY))
-                                        .child("先选择一个已有 Agent，再从常用模板开始。"),
+                                        .text_size(font_px(CODEX_SUGGESTION_TITLE_SIZE))
+                                        .font_semibold()
+                                        .text_color(if is_dark_mode() {
+                                            fixed_rgb(0x8f_8f8f)
+                                        } else {
+                                            rgb(COLOR_TEXT_TERTIARY)
+                                        })
+                                        .child("建议"),
                                 )
                                 .child(
                                     div()
-                                        .h_flex()
-                                        .flex_wrap()
-                                        .gap_2()
+                                        .v_flex()
+                                        .w_full()
+                                        .gap(px(36.))
+                                        .mt(px(22.))
+                                        .pl(px(8.))
                                         .child(
-                                            settings_action_button("scheduled-template-daily", cx)
-                                                .label("每日简报")
-                                                .on_click(cx.listener(|view, _, window, cx| {
-                                                    view.open_scheduled_template(
-                                                        "每日项目简报",
-                                                        "总结过去一天的重要代码变更、风险和下一步。",
-                                                        ScheduledCadence::Daily,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                })),
+                                            scheduled_suggestion_row(
+                                                "scheduled-template-daily",
+                                                AppIcon::Notification,
+                                                0x2a_86ff,
+                                                "每日简报",
+                                                "工作日 8:00",
+                                                "以日历、未读电子邮件和优先事项摘要开启每个工作日",
+                                            )
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                view.open_scheduled_template(
+                                                    "每日简报",
+                                                    "以日历、未读电子邮件和优先事项摘要开启每个工作日。",
+                                                    ScheduledCadence::Workdays,
+                                                    "08:00",
+                                                    None,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
                                         )
                                         .child(
-                                            settings_action_button("scheduled-template-weekly", cx)
-                                                .label("每周回顾")
-                                                .on_click(cx.listener(|view, _, window, cx| {
-                                                    view.open_scheduled_template(
-                                                        "每周项目回顾",
-                                                        "回顾本周的代码变更、未完成事项和需要关注的风险。",
-                                                        ScheduledCadence::Weekly,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                })),
+                                            scheduled_suggestion_row(
+                                                "scheduled-template-weekly",
+                                                AppIcon::Notebook,
+                                                0x9c_5ef8,
+                                                "每周回顾",
+                                                "星期五（时间：16:00）",
+                                                "每周五将你最近的工作整理成简明的状态更新",
+                                            )
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                view.open_scheduled_template(
+                                                    "每周回顾",
+                                                    "每周五将你最近的工作整理成简明的状态更新。",
+                                                    ScheduledCadence::Weekly,
+                                                    "16:00",
+                                                    Some(5),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
                                         )
                                         .child(
-                                            settings_action_button("scheduled-template-monitor", cx)
-                                                .label("跟进监控")
-                                                .on_click(cx.listener(|view, _, window, cx| {
-                                                    view.open_scheduled_template(
-                                                        "定期跟进",
-                                                        "检查当前工作的最新状态；仅在有重要变化时报告。",
-                                                        ScheduledCadence::Interval,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                })),
+                                            scheduled_suggestion_row(
+                                                "scheduled-template-monitor",
+                                                AppIcon::FileSearch,
+                                                0x38_c164,
+                                                "跟进监控",
+                                                "工作日 9:00",
+                                                "查看最近的电子邮箱和日历活动，并标记需要你关注的事项",
+                                            )
+                                            .on_click(cx.listener(|view, _, window, cx| {
+                                                view.open_scheduled_template(
+                                                    "跟进监控",
+                                                    "查看最近的电子邮箱和日历活动，并标记需要你关注的事项。",
+                                                    ScheduledCadence::Workdays,
+                                                    "09:00",
+                                                    None,
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
                                         ),
                                 ),
                         )
@@ -1224,6 +1263,84 @@ impl ConnectionView {
             ),
         )
     }
+}
+
+fn scheduled_suggestion_row(
+    id: &'static str,
+    icon: AppIcon,
+    icon_color: u32,
+    title: &'static str,
+    timing: &'static str,
+    description: &'static str,
+) -> gpui::Stateful<Div> {
+    let title_color = if is_dark_mode() {
+        fixed_rgb(0xd7_d7d7)
+    } else {
+        rgb(COLOR_TEXT)
+    };
+    let muted_color = if is_dark_mode() {
+        fixed_rgb(0x8f_8f8f)
+    } else {
+        rgb(COLOR_TEXT_SECONDARY)
+    };
+    let description_color = if is_dark_mode() {
+        fixed_rgb(0x84_8484)
+    } else {
+        rgb(COLOR_TEXT_TERTIARY)
+    };
+    let hover_color = if is_dark_mode() {
+        fixed_rgb(0x18_1818)
+    } else {
+        rgb(COLOR_SURFACE_UNDER)
+    };
+
+    div()
+        .id(id)
+        .h_flex()
+        .w_full()
+        .min_h(px(44.))
+        .items_start()
+        .gap(px(8.))
+        .rounded(px(8.))
+        .cursor_pointer()
+        .hover(move |row| row.bg(hover_color))
+        .child(
+            div()
+                .h_flex()
+                .w(px(16.))
+                .flex_none()
+                .items_start()
+                .justify_center()
+                .pt(px(2.))
+                .child(
+                    Icon::new(icon)
+                        .size(px(17.))
+                        .text_color(fixed_rgb(icon_color)),
+                ),
+        )
+        .child(
+            div()
+                .v_flex()
+                .min_w(px(0.))
+                .gap(px(3.))
+                .child(
+                    div()
+                        .h_flex()
+                        .flex_wrap()
+                        .items_baseline()
+                        .gap_2()
+                        .text_size(font_px(CODEX_SUGGESTION_ITEM_SIZE))
+                        .child(div().font_semibold().text_color(title_color).child(title))
+                        .child(div().text_color(muted_color).child(timing)),
+                )
+                .child(
+                    div()
+                        .text_size(font_px(CODEX_SUGGESTION_DESCRIPTION_SIZE))
+                        .line_height(px(20.))
+                        .text_color(description_color)
+                        .child(description),
+                ),
+        )
 }
 
 #[cfg(test)]

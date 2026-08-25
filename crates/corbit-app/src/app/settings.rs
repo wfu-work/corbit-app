@@ -174,7 +174,10 @@ impl ConnectionView {
         cx: &mut Context<Self>,
     ) {
         configure_codex_theme(self.appearance, Some(window), cx);
-        self.appearance_error = self.appearance.save().err().map(|error| error.to_string());
+        let icon_error =
+            application_icon::apply(self.appearance.app_icon_mode, is_dark_mode()).err();
+        let save_error = self.appearance.save().err();
+        self.appearance_error = icon_error.or(save_error).map(|error| error.to_string());
         cx.notify();
     }
 
@@ -185,6 +188,16 @@ impl ConnectionView {
         cx: &mut Context<Self>,
     ) {
         self.appearance.color_scheme = color_scheme;
+        self.apply_appearance_preferences(window, cx);
+    }
+
+    fn set_app_icon_mode(
+        &mut self,
+        app_icon_mode: AppIconMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.appearance.app_icon_mode = app_icon_mode;
         self.apply_appearance_preferences(window, cx);
     }
 
@@ -1887,6 +1900,44 @@ impl ConnectionView {
                     }))
             },
         ));
+        let app_icon_modes = appearance_option_group(AppIconMode::ALL.into_iter().enumerate().map(
+            |(index, option)| {
+                Button::new(("appearance-app-icon-mode", index))
+                    .ghost()
+                    .small()
+                    .selected(self.appearance.app_icon_mode == option)
+                    .label(option.label())
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.set_app_icon_mode(option, window, cx);
+                    }))
+            },
+        ));
+        let active_icon_is_dark = self
+            .appearance
+            .app_icon_mode
+            .resolves_to_dark(is_dark_mode());
+        let app_icon_cards = div().h_flex().w_full().gap_3().children([
+            appearance_app_icon_card(
+                0,
+                APP_ICON_LIGHT_ASSET,
+                "浅色图标",
+                !active_icon_is_dark,
+                self.appearance.accent_color,
+            )
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.set_app_icon_mode(AppIconMode::Light, window, cx);
+            })),
+            appearance_app_icon_card(
+                1,
+                APP_ICON_DARK_ASSET,
+                "深色图标",
+                active_icon_is_dark,
+                self.appearance.accent_color,
+            )
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.set_app_icon_mode(AppIconMode::Dark, window, cx);
+            })),
+        ]);
 
         settings_page_header(
             "外观",
@@ -1909,6 +1960,22 @@ impl ConnectionView {
         .child(
             settings_section("主题", "选择基础外观，系统模式会自动响应 macOS 外观变化。")
                 .child(theme_choices),
+        )
+        .child(
+            settings_section(
+                "应用图标",
+                "选择 Dock 与应用切换器中的图标样式，跟随外观会随当前主题自动切换。",
+            )
+            .child(
+                appearance_row_group()
+                    .child(appearance_setting_row(
+                        "图标样式",
+                        "浅色和深色图标都会立即更新 macOS Dock 图标。",
+                        app_icon_modes,
+                    ))
+                    .child(settings_row_divider())
+                    .child(div().p_3().child(app_icon_cards)),
+            ),
         )
         .child(
             settings_section(
@@ -3149,6 +3216,76 @@ fn appearance_theme_card(
                                     .bg(fixed_rgb(appearance.accent_color)),
                             )
                         }),
+                ),
+        )
+}
+
+fn appearance_app_icon_card(
+    index: usize,
+    asset: &'static str,
+    label: &'static str,
+    selected: bool,
+    accent_color: u32,
+) -> Button {
+    Button::new(("appearance-app-icon-card", index))
+        .ghost()
+        .small()
+        .flex_1()
+        .min_w(px(0.))
+        .h(px(116.))
+        .rounded_lg()
+        .border_1()
+        .border_color(if selected {
+            fixed_rgb(accent_color)
+        } else {
+            rgb(COLOR_BORDER)
+        })
+        .bg(if selected {
+            rgb(COLOR_SURFACE_SECONDARY)
+        } else {
+            rgb(COLOR_SURFACE)
+        })
+        .p_3()
+        .child(
+            div()
+                .h_flex()
+                .w_full()
+                .h_full()
+                .items_center()
+                .gap_3()
+                .child(img(asset).flex_none().size(px(72.)))
+                .child(
+                    div()
+                        .v_flex()
+                        .min_w(px(0.))
+                        .gap_2()
+                        .items_start()
+                        .child(
+                            div()
+                                .text_size(font_px(FONT_SIZE_SM))
+                                .font_medium()
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .h_flex()
+                                .items_center()
+                                .gap_1()
+                                .text_size(font_px(FONT_SIZE_XS))
+                                .text_color(if selected {
+                                    fixed_rgb(accent_color)
+                                } else {
+                                    rgb(COLOR_TEXT_TERTIARY)
+                                })
+                                .when(selected, |status| {
+                                    status.child(Icon::new(AppIcon::Success).size(px(14.)))
+                                })
+                                .child(if selected {
+                                    "当前使用"
+                                } else {
+                                    "主题预览"
+                                }),
+                        ),
                 ),
         )
 }

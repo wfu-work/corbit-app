@@ -7,8 +7,8 @@ mod provider_switch;
 use super::*;
 use chrono::{DateTime, Utc};
 use composer::{
-    MAX_PROMPT_ATTACHMENTS, attachment_size_label, context_window_percent, load_prompt_attachments,
-    permission_mode_copy,
+    MAX_PROMPT_ATTACHMENTS, attachment_size_label, context_window_percent, load_clipboard_image,
+    load_prompt_attachments, permission_mode_copy, prompt_clipboard_image,
 };
 use gpui::ease_out_quint;
 pub(super) use index::ConversationIndexInteraction;
@@ -1173,6 +1173,51 @@ impl ConnectionView {
             });
         })
         .detach();
+    }
+
+    pub(super) fn paste_prompt_image(&mut self, image: &gpui::Image, cx: &mut Context<Self>) {
+        if self.prompt_in_flight || self.attachment_in_flight {
+            self.show_warning("Prompt 正在提交或附件正在加载，请稍候", cx);
+            return;
+        }
+
+        let existing_bytes = self
+            .prompt_attachments
+            .iter()
+            .map(|attachment| attachment.size_bytes)
+            .sum();
+        match load_clipboard_image(
+            image,
+            self.clipboard_image_sequence + 1,
+            self.prompt_attachments.len(),
+            existing_bytes,
+        ) {
+            Ok(attachment) => {
+                self.clipboard_image_sequence += 1;
+                self.prompt_attachments.push(attachment);
+                self.show_success("已粘贴图片附件", cx);
+                cx.notify();
+            }
+            Err(message) => self.show_error(message, cx),
+        }
+    }
+
+    pub(super) fn paste_prompt_clipboard(
+        &mut self,
+        input: &Entity<InputState>,
+        clipboard: &ClipboardItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(image) = prompt_clipboard_image(clipboard) {
+            self.paste_prompt_image(&image, cx);
+            return;
+        }
+
+        let Some(text) = clipboard.text() else {
+            return;
+        };
+        input.update(cx, |input, cx| input.replace(text, window, cx));
     }
 
     fn remove_prompt_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -3599,7 +3644,7 @@ impl ConnectionView {
             .ghost()
             .xsmall()
             .icon(Icon::new(AppIcon::Add))
-            .tooltip("添加图片、文本或代码附件")
+            .tooltip("添加附件，或直接粘贴图片")
             .loading(self.attachment_in_flight)
             .disabled(
                 !can_prompt
@@ -3615,41 +3660,85 @@ impl ConnectionView {
             .enumerate()
             .map(|(index, attachment)| {
                 let name = attachment.upload.name.clone();
-                div()
-                    .h_flex()
-                    .max_w(px(260.))
-                    .items_center()
-                    .gap_1()
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(rgb(COLOR_BORDER))
-                    .bg(rgb(COLOR_SURFACE_SECONDARY))
-                    .pl_2()
-                    .pr_1()
-                    .py_1()
-                    .child(Icon::new(AppIcon::File).size(px(14.)))
-                    .child(
-                        div()
-                            .min_w(px(0.))
-                            .truncate()
-                            .text_size(font_px(FONT_SIZE_XS))
-                            .child(format!(
-                                "{} · {}",
-                                name,
-                                attachment_size_label(attachment.size_bytes)
-                            )),
-                    )
-                    .child(
-                        Button::new(("remove-prompt-attachment", index))
-                            .ghost()
-                            .xsmall()
-                            .icon(Icon::new(AppIcon::Close).size(px(12.)))
-                            .tooltip("移除附件")
-                            .disabled(self.prompt_in_flight)
-                            .on_click(cx.listener(move |view, _, _, cx| {
-                                view.remove_prompt_attachment(index, cx);
-                            })),
-                    )
+                if let Some(image) = attachment.preview.clone() {
+                    div()
+                        .relative()
+                        .size(px(72.))
+                        .flex_none()
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(rgb(COLOR_BORDER_HEAVY))
+                        .bg(rgb(COLOR_SURFACE_SECONDARY))
+                        .overflow_hidden()
+                        .child(img(image).size_full().object_fit(ObjectFit::Cover))
+                        .child(
+                            Button::new(("remove-prompt-image", index))
+                                .ghost()
+                                .with_size(px(22.))
+                                .rounded(px(11.))
+                                .absolute()
+                                .top(px(4.))
+                                .right(px(4.))
+                                .bg(if is_dark_mode() {
+                                    fixed_rgb(0x2b_2b2b)
+                                } else {
+                                    fixed_rgb(0xff_ffff)
+                                })
+                                .icon(Icon::new(AppIcon::Close).size(px(11.)))
+                                .tooltip(format!("移除图片 {name}"))
+                                .disabled(self.prompt_in_flight)
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.remove_prompt_attachment(index, cx);
+                                })),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .h_flex()
+                        .max_w(px(260.))
+                        .items_center()
+                        .gap_1()
+                        .rounded(px(8.))
+                        .border_1()
+                        .border_color(rgb(COLOR_BORDER))
+                        .bg(rgb(COLOR_SURFACE_SECONDARY))
+                        .pl_1()
+                        .pr_1()
+                        .py_1()
+                        .child(
+                            div()
+                                .size(px(36.))
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.))
+                                .bg(rgb(COLOR_SURFACE))
+                                .child(Icon::new(AppIcon::File).size(px(14.))),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(font_px(FONT_SIZE_XS))
+                                .child(format!(
+                                    "{} · {}",
+                                    name,
+                                    attachment_size_label(attachment.size_bytes)
+                                )),
+                        )
+                        .child(
+                            Button::new(("remove-prompt-attachment", index))
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(AppIcon::Close).size(px(12.)))
+                                .tooltip("移除附件")
+                                .disabled(self.prompt_in_flight)
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.remove_prompt_attachment(index, cx);
+                                })),
+                        )
+                        .into_any_element()
+                }
             })
             .collect::<Vec<_>>();
         let composer_permissions = conversation_permissions
