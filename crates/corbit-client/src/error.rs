@@ -14,6 +14,8 @@ pub enum ClientError {
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("daemon authentication failed")]
     AuthenticationFailed,
+    #[error("Relay authentication failed: {code}")]
+    RelayAuthentication { code: String },
     #[error("daemon protocol {actual} is incompatible; client requires {expected}")]
     IncompatibleProtocol { expected: u32, actual: u32 },
     #[error("daemon closed the connection: code={code:?}, reason={reason}")]

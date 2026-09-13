@@ -4,6 +4,7 @@ use corbit_protocol::{ClientIdentity, ClientKind};
 use url::Url;
 
 use crate::ClientError;
+use crate::RelayConfig;
 
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
@@ -16,6 +17,9 @@ pub struct ClientConfig {
     pub heartbeat_interval: Duration,
     pub reconnect_initial_delay: Duration,
     pub reconnect_max_delay: Duration,
+    /// Optional Relay Protocol v1 transport. When set, the Corbit protocol
+    /// session is tunneled through `/v1/connect` instead of `/ws`.
+    pub relay: Option<RelayConfig>,
 }
 
 impl ClientConfig {
@@ -59,7 +63,13 @@ impl ClientConfig {
             heartbeat_interval: Duration::from_secs(20),
             reconnect_initial_delay: Duration::from_millis(500),
             reconnect_max_delay: Duration::from_secs(15),
+            relay: None,
         })
+    }
+
+    pub fn with_relay(mut self, relay: RelayConfig) -> Self {
+        self.relay = Some(relay);
+        self
     }
 
     pub(crate) fn http_url(&self, path: &str) -> Result<Url, ClientError> {

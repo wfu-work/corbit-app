@@ -3,6 +3,7 @@
 mod client;
 mod config;
 mod error;
+mod relay;
 mod runtime;
 
 pub use client::{ConnectionEvent, ConnectionState, CorbitClient, CorbitConnection};
@@ -31,4 +32,5 @@ pub use corbit_protocol::{
     WorkspaceStatus,
 };
 pub use error::ClientError;
+pub use relay::{RelayConfig, RelayConnection};
 pub use runtime::{DaemonRuntime, DaemonRuntimeClient, RuntimeEvent};

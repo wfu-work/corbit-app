@@ -19,18 +19,17 @@ use http::header::{AUTHORIZATION, HeaderValue};
 use reqwest::StatusCode;
 use serde_json::Value;
 use tokio::{
-    net::TcpStream,
     sync::{broadcast, mpsc, oneshot, watch},
     time::timeout,
 };
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
 
-use crate::{ClientConfig, ClientError};
+use crate::{ClientConfig, ClientError, RelayConfig, RelayConnection};
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+use crate::relay::Socket;
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 512;
 
@@ -265,26 +264,41 @@ impl CorbitClient {
     }
 
     async fn connect_inner(&self) -> Result<CorbitConnection, ClientError> {
-        let websocket_url = self.config.websocket_url()?;
-        let mut request = websocket_url
-            .as_str()
-            .into_client_request()
-            .map_err(ClientError::WebSocket)?;
-        request.headers_mut().insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.config.token)).map_err(|error| {
-                ClientError::InvalidConfiguration(format!("invalid daemon token: {error}"))
-            })?,
-        );
-
         self.emit(ConnectionEvent::StateChanged(
             ConnectionState::Authenticating,
         ));
-        let (mut socket, _) = timeout(self.config.connect_timeout, connect_async(request))
-            .await
-            .map_err(|_| ClientError::Timeout {
-                operation: "connecting to the daemon",
-            })??;
+        let (mut socket, relay_mode): (Socket, Option<RelayConfig>) = if let Some(relay) =
+            self.config.relay.clone()
+        {
+            let connection = timeout(self.config.connect_timeout, RelayConnection::connect(relay))
+                .await
+                .map_err(|_| ClientError::Timeout {
+                    operation: "connecting to Relay",
+                })??;
+            let (socket, config) = connection.into_parts();
+            (socket, Some(config))
+        } else {
+            let websocket_url = self.config.websocket_url()?;
+            let mut request = websocket_url
+                .as_str()
+                .into_client_request()
+                .map_err(ClientError::WebSocket)?;
+            request.headers_mut().insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", self.config.token)).map_err(
+                    |error| {
+                        ClientError::InvalidConfiguration(format!("invalid daemon token: {error}"))
+                    },
+                )?,
+            );
+            let socket = timeout(self.config.connect_timeout, connect_async(request))
+                .await
+                .map_err(|_| ClientError::Timeout {
+                    operation: "connecting to the daemon",
+                })??
+                .0;
+            (socket, None)
+        };
 
         let resume = {
             let recovery = lock_recovery(&self.recovery);
@@ -297,6 +311,7 @@ impl CorbitClient {
         };
         let requested_after = resume.last_sequence.unwrap_or_default();
         let requested_server_id = resume.server_id.clone();
+        let mut relay_sequence = 0;
         send_json(
             &mut socket,
             &ClientMessage::hello_with_resume(
@@ -304,11 +319,18 @@ impl CorbitClient {
                 self.config.capabilities.clone(),
                 Some(resume),
             ),
+            relay_mode.as_ref(),
+            &mut relay_sequence,
         )
         .await?;
 
-        let message =
-            next_server_message(&mut socket, self.config.connect_timeout, "handshaking").await?;
+        let message = next_server_message(
+            &mut socket,
+            self.config.connect_timeout,
+            "handshaking",
+            relay_mode.as_ref(),
+        )
+        .await?;
         let (session_id, server_info) = parse_server_info(message)?;
         let cursor_recovery = server_info
             .features
@@ -324,6 +346,7 @@ impl CorbitClient {
                 &server_info.server_id,
                 &self.recovery,
                 &self.events,
+                relay_mode.as_ref(),
             )
             .await?;
         } else {
@@ -343,6 +366,7 @@ impl CorbitClient {
             events,
             recovery,
             cursor_recovery,
+            relay_mode,
         ));
 
         Ok(CorbitConnection {
@@ -452,8 +476,15 @@ async fn synchronize_event_history(
     server_id: &str,
     recovery: &Arc<Mutex<RecoveryState>>,
     events: &broadcast::Sender<ConnectionEvent>,
+    relay_mode: Option<&RelayConfig>,
 ) -> Result<(), ClientError> {
-    let message = next_server_message(socket, duration, "starting event synchronization").await?;
+    let message = next_server_message(
+        socket,
+        duration,
+        "starting event synchronization",
+        relay_mode,
+    )
+    .await?;
     let (replay_from, latest_sequence, reset) = match message {
         ServerMessage::EventSync {
             phase: EventSyncPhase::Begin,
@@ -503,7 +534,9 @@ async fn synchronize_event_history(
     }
 
     loop {
-        let message = next_server_message(socket, duration, "synchronizing event history").await?;
+        let message =
+            next_server_message(socket, duration, "synchronizing event history", relay_mode)
+                .await?;
         match message {
             ServerMessage::EventSync {
                 phase: EventSyncPhase::Complete,
@@ -558,7 +591,9 @@ fn lock_recovery(recovery: &Arc<Mutex<RecoveryState>>) -> MutexGuard<'_, Recover
 
 fn state_for_error(error: &ClientError) -> ConnectionState {
     match error {
-        ClientError::AuthenticationFailed => ConnectionState::AuthenticationFailed,
+        ClientError::AuthenticationFailed | ClientError::RelayAuthentication { .. } => {
+            ConnectionState::AuthenticationFailed
+        }
         ClientError::IncompatibleProtocol { expected, actual } => ConnectionState::Incompatible {
             expected: *expected,
             actual: *actual,
@@ -593,7 +628,9 @@ impl SessionEnd {
     fn from_result(result: &Result<(), ClientError>) -> Self {
         match result {
             Ok(()) => Self::Graceful,
-            Err(ClientError::AuthenticationFailed) => Self::AuthenticationFailed,
+            Err(ClientError::AuthenticationFailed | ClientError::RelayAuthentication { .. }) => {
+                Self::AuthenticationFailed
+            }
             Err(error) if session_error_is_reconnectable(error) => {
                 Self::Reconnectable(error.to_string())
             }
@@ -1135,6 +1172,7 @@ async fn run_session_driver(
     events: broadcast::Sender<ConnectionEvent>,
     recovery: Arc<Mutex<RecoveryState>>,
     strict_event_sequence: bool,
+    relay_mode: Option<RelayConfig>,
 ) {
     let mut pending_pings = HashMap::new();
     let mut pending_rpcs = HashMap::new();
@@ -1147,6 +1185,7 @@ async fn run_session_driver(
         &events,
         &recovery,
         strict_event_sequence,
+        relay_mode.as_ref(),
     )
     .await;
     let end = SessionEnd::from_result(&result);
@@ -1171,7 +1210,9 @@ async fn drive_session(
     events: &broadcast::Sender<ConnectionEvent>,
     recovery: &Arc<Mutex<RecoveryState>>,
     strict_event_sequence: bool,
+    relay_mode: Option<&RelayConfig>,
 ) -> Result<(), ClientError> {
+    let mut relay_sequence = 0;
     loop {
         tokio::select! {
             biased;
@@ -1191,7 +1232,13 @@ async fn drive_session(
                         if response.is_closed() {
                             continue;
                         }
-                        send_json(socket, &ClientMessage::ping(&id)).await?;
+                        send_json(
+                            socket,
+                            &ClientMessage::ping(&id),
+                            relay_mode,
+                            &mut relay_sequence,
+                        )
+                        .await?;
                         if !response.is_closed() {
                             pending_pings.insert(id, response);
                         }
@@ -1203,6 +1250,8 @@ async fn drive_session(
                         send_json(
                             socket,
                             &ClientMessage::rpc_request(&id, method, params),
+                            relay_mode,
+                            &mut relay_sequence,
                         )
                         .await?;
                         if !response.is_closed() {
@@ -1228,6 +1277,7 @@ async fn drive_session(
                     events,
                     recovery,
                     strict_event_sequence,
+                    relay_mode,
                 )
                 .await?;
             }
@@ -1243,18 +1293,22 @@ async fn handle_frame(
     events: &broadcast::Sender<ConnectionEvent>,
     recovery: &Arc<Mutex<RecoveryState>>,
     strict_event_sequence: bool,
+    relay_mode: Option<&RelayConfig>,
 ) -> Result<(), ClientError> {
     match frame {
         Message::Text(text) => {
-            let message: ServerMessage = serde_json::from_str(text.as_ref())?;
-            route_server_message(
-                message,
-                pending_pings,
-                pending_rpcs,
-                events,
-                recovery,
-                strict_event_sequence,
-            )
+            if let Some(message) = decode_server_payload(text.as_ref(), relay_mode)? {
+                route_server_message(
+                    message,
+                    pending_pings,
+                    pending_rpcs,
+                    events,
+                    recovery,
+                    strict_event_sequence,
+                )
+            } else {
+                Ok(())
+            }
         }
         Message::Ping(payload) => {
             socket.send(Message::Pong(payload)).await?;
@@ -1403,10 +1457,32 @@ fn fail_pending(
     }
 }
 
-async fn send_json(socket: &mut Socket, message: &ClientMessage) -> Result<(), ClientError> {
-    socket
-        .send(Message::text(serde_json::to_string(message)?))
-        .await?;
+async fn send_json(
+    socket: &mut Socket,
+    message: &ClientMessage,
+    relay_mode: Option<&RelayConfig>,
+    relay_sequence: &mut u64,
+) -> Result<(), ClientError> {
+    let payload = serde_json::to_value(message)?;
+    let value = if let Some(relay) = relay_mode {
+        *relay_sequence = relay_sequence.saturating_add(1);
+        let mut envelope = serde_json::json!({
+            "version": 1,
+            "type": "stream.message",
+            "messageId": format!("msg_{}", uuid::Uuid::new_v4()),
+            "streamId": format!("corbit:{}", relay.endpoint_id),
+            "sequence": *relay_sequence,
+            "protocol": "corbit.v1",
+            "payload": payload,
+        });
+        if let Some(target) = relay.target_endpoint_id.as_deref() {
+            envelope["to"] = Value::String(target.to_owned());
+        }
+        envelope
+    } else {
+        payload
+    };
+    socket.send(Message::text(value.to_string())).await?;
     Ok(())
 }
 
@@ -1414,6 +1490,7 @@ async fn next_server_message(
     socket: &mut Socket,
     duration: Duration,
     operation: &'static str,
+    relay_mode: Option<&RelayConfig>,
 ) -> Result<ServerMessage, ClientError> {
     loop {
         let frame = timeout(duration, socket.next())
@@ -1424,7 +1501,11 @@ async fn next_server_message(
                 reason: String::new(),
             })??;
         match frame {
-            Message::Text(text) => return serde_json::from_str(text.as_ref()).map_err(Into::into),
+            Message::Text(text) => {
+                if let Some(message) = decode_server_payload(text.as_ref(), relay_mode)? {
+                    return Ok(message);
+                }
+            }
             Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
             Message::Pong(_) | Message::Frame(_) => {}
             Message::Close(frame) => {
@@ -1440,5 +1521,75 @@ async fn next_server_message(
                 return Err(ClientError::UnexpectedMessage { operation });
             }
         }
+    }
+}
+
+/// Decodes a daemon payload, returning `None` for Relay-only control frames.
+///
+/// Relay acknowledgements, heartbeats, and peer lifecycle notifications are
+/// transport metadata; they must not be handed to Corbit's protocol decoder or
+/// treated as a session failure. The same applies to the reserved
+/// `relay-control` stream used for future control extensions.
+fn decode_server_payload(
+    text: &str,
+    relay_mode: Option<&RelayConfig>,
+) -> Result<Option<ServerMessage>, ClientError> {
+    if relay_mode.is_none() {
+        return serde_json::from_str(text).map(Some).map_err(Into::into);
+    }
+    let outer: Value = serde_json::from_str(text)?;
+    match outer.get("type").and_then(Value::as_str) {
+        Some("stream.message") => {
+            let protocol = outer
+                .get("protocol")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let stream_id = outer
+                .get("streamId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if protocol == "relay.v1" && stream_id == "relay-control" {
+                return Ok(None);
+            }
+            // A Space may carry multiple product protocols. Corbit only owns
+            // corbit.v1 payloads; ignore other opaque streams instead of
+            // attempting to deserialize them as ServerMessage.
+            if protocol != "corbit.v1" {
+                return Ok(None);
+            }
+            let payload = outer.get("payload").ok_or(ClientError::UnexpectedMessage {
+                operation: "reading the Relay payload",
+            })?;
+            serde_json::from_value(payload.clone())
+                .map(Some)
+                .map_err(Into::into)
+        }
+        Some("relay.error") => {
+            let code = outer
+                .get("code")
+                .and_then(Value::as_str)
+                .unwrap_or("relay.error");
+            if code.starts_with("auth.") {
+                return Err(ClientError::RelayAuthentication { code: code.into() });
+            }
+            let error = corbit_protocol::ProtocolErrorBody {
+                code: code.into(),
+                message: outer
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Relay rejected the frame")
+                    .into(),
+                details: None,
+            };
+            Err(ClientError::Protocol(error))
+        }
+        Some("stream.open")
+        | Some("stream.ack")
+        | Some("pong")
+        | Some("relay.peer_joined")
+        | Some("relay.peer_left") => Ok(None),
+        _ => Err(ClientError::UnexpectedMessage {
+            operation: "reading the Relay payload",
+        }),
     }
 }
